@@ -681,6 +681,61 @@ async fn consume_provider_streaming_response(
     Ok(outcome)
 }
 
+async fn chat_provider_with_optional_timeout(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+    step_timeout_secs: Option<u64>,
+) -> Result<zeroclaw_providers::ChatResponse> {
+    let chat_future = provider.chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
+        model,
+        Some(temperature),
+    );
+
+    match step_timeout_secs {
+        Some(step_secs) if step_secs > 0 => {
+            let step_timeout = Duration::from_secs(step_secs);
+            if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                    result = tokio::time::timeout(step_timeout, chat_future) => {
+                        match result {
+                            Ok(inner) => inner,
+                            Err(_) => anyhow::bail!(
+                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                            ),
+                        }
+                    },
+                }
+            } else {
+                match tokio::time::timeout(step_timeout, chat_future).await {
+                    Ok(inner) => inner,
+                    Err(_) => anyhow::bail!(
+                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                    ),
+                }
+            }
+        }
+        _ => {
+            if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                    result = chat_future => result,
+                }
+            } else {
+                chat_future.await
+            }
+        }
+    }
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -1124,7 +1179,7 @@ pub async fn run_tool_call_loop(
         let mut streamed_live_deltas = false;
 
         let chat_result = if should_consume_provider_stream {
-            match consume_provider_streaming_response(
+            let stream_future = consume_provider_streaming_response(
                 active_provider,
                 &prepared_messages.messages,
                 request_tools,
@@ -1132,9 +1187,35 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
-            )
-            .await
-            {
+            );
+            let stream_result = match pacing.step_timeout_secs {
+                Some(step_secs) if step_secs > 0 => {
+                    let step_timeout = Duration::from_secs(step_secs);
+                    if let Some(token) = cancellation_token.as_ref() {
+                        tokio::select! {
+                            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                            result = tokio::time::timeout(step_timeout, stream_future) => {
+                                match result {
+                                    Ok(inner) => inner,
+                                    Err(_) => Err(anyhow::anyhow!(
+                                        "provider streaming timed out after {step_secs}s (step_timeout_secs)"
+                                    )),
+                                }
+                            },
+                        }
+                    } else {
+                        match tokio::time::timeout(step_timeout, stream_future).await {
+                            Ok(inner) => inner,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "provider streaming timed out after {step_secs}s (step_timeout_secs)"
+                            )),
+                        }
+                    }
+                }
+                _ => stream_future.await,
+            };
+
+            match stream_result {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
                     let reasoning_content = if streamed.reasoning_content.is_empty() {
@@ -1169,73 +1250,29 @@ pub async fn run_tool_call_loop(
                             "error": scrub_credentials(&stream_err.to_string()),
                         }),
                     );
-                    {
-                        let chat_future = active_provider.chat(
-                            ChatRequest {
-                                messages: &prepared_messages.messages,
-                                tools: request_tools,
-                            },
-                            active_model,
-                            Some(temperature),
-                        );
-                        if let Some(token) = cancellation_token.as_ref() {
-                            tokio::select! {
-                                () = token.cancelled() => Err(ToolLoopCancelled.into()),
-                                result = chat_future => result,
-                            }
-                        } else {
-                            chat_future.await
-                        }
-                    }
+                    chat_provider_with_optional_timeout(
+                        active_provider,
+                        &prepared_messages.messages,
+                        request_tools,
+                        active_model,
+                        temperature,
+                        cancellation_token.as_ref(),
+                        pacing.step_timeout_secs,
+                    )
+                    .await
                 }
             }
         } else {
-            // Non-streaming path: wrap with optional per-step timeout from
-            // pacing config to catch hung model responses.
-            let chat_future = active_provider.chat(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
+            chat_provider_with_optional_timeout(
+                active_provider,
+                &prepared_messages.messages,
+                request_tools,
                 active_model,
-                Some(temperature),
-            );
-
-            match pacing.step_timeout_secs {
-                Some(step_secs) if step_secs > 0 => {
-                    let step_timeout = Duration::from_secs(step_secs);
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = tokio::time::timeout(step_timeout, chat_future) => {
-                                match result {
-                                    Ok(inner) => inner,
-                                    Err(_) => anyhow::bail!(
-                                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                    ),
-                                }
-                            },
-                        }
-                    } else {
-                        match tokio::time::timeout(step_timeout, chat_future).await {
-                            Ok(inner) => inner,
-                            Err(_) => anyhow::bail!(
-                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                            ),
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = chat_future => result,
-                        }
-                    } else {
-                        chat_future.await
-                    }
-                }
-            }
+                temperature,
+                cancellation_token.as_ref(),
+                pacing.step_timeout_secs,
+            )
+            .await
         };
 
         let (
@@ -4108,6 +4145,66 @@ mod tests {
         }
     }
 
+    struct HangingStreamFallbackProvider {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl HangingStreamFallbackProvider {
+        fn new() -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for HangingStreamFallbackProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in hanging stream tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("fallback after stream timeout".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures_util::stream::pending())
+        }
+    }
+
     #[async_trait]
     impl Provider for StreamingScriptedProvider {
         async fn chat_with_system(
@@ -5932,6 +6029,58 @@ mod tests {
         );
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_stream_timeout_falls_back_to_chat() {
+        let provider = HangingStreamFallbackProvider::new();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, _rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            step_timeout_secs: Some(1),
+            ..Default::default()
+        };
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &pacing,
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("stream timeout should fall back to non-streaming chat");
+
+        assert_eq!(result, "fallback after stream timeout");
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

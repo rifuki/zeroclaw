@@ -22,6 +22,9 @@ use super::personality::EDITABLE_PERSONALITY_FILES;
 const IDENTITY: &str = include_str!("IDENTITY.md");
 const SOUL: &str = include_str!("SOUL.md");
 const USER: &str = include_str!("USER.md");
+const COMMANDS: &str = include_str!("COMMANDS.md");
+const CHANNEL_GUIDE: &str = include_str!("CHANNEL_GUIDE.md");
+const WORKFLOW: &str = include_str!("WORKFLOW.md");
 const HEARTBEAT: &str = include_str!("HEARTBEAT.md");
 const TOOLS: &str = include_str!("TOOLS.md");
 const MEMORY: &str = include_str!("MEMORY.md");
@@ -78,6 +81,9 @@ pub fn render(filename: &str, ctx: &TemplateContext) -> Option<String> {
         "IDENTITY.md" => IDENTITY,
         "SOUL.md" => SOUL,
         "USER.md" => USER,
+        "COMMANDS.md" => COMMANDS,
+        "CHANNEL_GUIDE.md" => CHANNEL_GUIDE,
+        "WORKFLOW.md" => WORKFLOW,
         "HEARTBEAT.md" => HEARTBEAT,
         "TOOLS.md" => TOOLS,
         "AGENTS.md" => {

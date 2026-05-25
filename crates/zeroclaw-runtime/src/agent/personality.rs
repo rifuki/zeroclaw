@@ -1,5 +1,6 @@
-//! Personality system — loads workspace identity files (SOUL.md, IDENTITY.md,
-//! USER.md) and injects them into the system prompt pipeline.
+//! Personality system — loads workspace identity and policy files (SOUL.md,
+//! IDENTITY.md, USER.md, AGENTS.md, etc.) and injects them into the system
+//! prompt pipeline.
 //!
 //! Ported from RustyClaw `src/agent/personality.rs`.  The loader reads markdown
 //! files from the workspace root, validates size limits, and produces a
@@ -13,10 +14,13 @@ pub const MAX_FILE_CHARS: usize = 20_000;
 
 /// Well-known personality files loaded from the workspace root.
 pub const PERSONALITY_FILES: &[&str] = &[
+    "AGENTS.md",
     "SOUL.md",
     "IDENTITY.md",
     "USER.md",
-    "AGENTS.md",
+    "COMMANDS.md",
+    "CHANNEL_GUIDE.md",
+    "WORKFLOW.md",
     "TOOLS.md",
     "HEARTBEAT.md",
     "BOOTSTRAP.md",
@@ -29,10 +33,13 @@ pub const PERSONALITY_FILES: &[&str] = &[
 /// the user is meant to hand-edit. The runtime still injects it when
 /// it exists on disk.
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
+    "AGENTS.md",
     "SOUL.md",
     "IDENTITY.md",
     "USER.md",
-    "AGENTS.md",
+    "COMMANDS.md",
+    "CHANNEL_GUIDE.md",
+    "WORKFLOW.md",
     "TOOLS.md",
     "HEARTBEAT.md",
     "MEMORY.md",
@@ -106,8 +113,12 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
     let mut profile = PersonalityProfile::default();
 
     for &filename in filenames {
-        let path = workspace_dir.join(filename);
-        match std::fs::read_to_string(&path) {
+        let Some((path, raw)) = read_workspace_personality_file(workspace_dir, filename) else {
+            profile.missing.push(filename.to_string());
+            continue;
+        };
+
+        match raw {
             Ok(raw) => {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
@@ -122,13 +133,27 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
                     path,
                 });
             }
-            Err(_) => {
-                profile.missing.push(filename.to_string());
-            }
+            Err(_) => profile.missing.push(filename.to_string()),
         }
     }
 
     profile
+}
+
+fn read_workspace_personality_file(
+    workspace_dir: &Path,
+    filename: &str,
+) -> Option<(PathBuf, std::io::Result<String>)> {
+    let primary = workspace_dir.join(filename);
+    if primary.exists() || filename != "MEMORY.md" {
+        return Some((primary.clone(), std::fs::read_to_string(primary)));
+    }
+
+    let nested_memory = workspace_dir.join("memory").join("MEMORY.md");
+    Some((
+        nested_memory.clone(),
+        std::fs::read_to_string(nested_memory),
+    ))
 }
 
 /// Truncate content to `MAX_FILE_CHARS` if necessary.
@@ -234,6 +259,61 @@ mod tests {
         let profile = load_personality(&ws);
         let rendered = profile.render();
         assert!(rendered.contains("[... truncated at"));
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn load_personality_reads_policy_files() {
+        let ws = setup_workspace(&[
+            ("COMMANDS.md", "run commands directly"),
+            ("CHANNEL_GUIDE.md", "split bubbles"),
+            ("WORKFLOW.md", "verify output"),
+        ]);
+
+        let profile = load_personality(&ws);
+        assert_eq!(profile.get("COMMANDS.md").unwrap(), "run commands directly");
+        assert_eq!(profile.get("CHANNEL_GUIDE.md").unwrap(), "split bubbles");
+        assert_eq!(profile.get("WORKFLOW.md").unwrap(), "verify output");
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn load_personality_uses_nested_memory_when_root_missing() {
+        let ws = setup_workspace(&[]);
+        let nested_dir = ws.join("memory");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("MEMORY.md"), "nested memory").unwrap();
+
+        let profile = load_personality(&ws);
+        let memory = profile
+            .files
+            .iter()
+            .find(|file| file.name == "MEMORY.md")
+            .unwrap();
+        assert_eq!(memory.content, "nested memory");
+        assert!(memory.path.ends_with("memory/MEMORY.md"));
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn load_personality_prefers_root_memory() {
+        let ws = setup_workspace(&[("MEMORY.md", "root memory")]);
+        let nested_dir = ws.join("memory");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("MEMORY.md"), "nested memory").unwrap();
+
+        let profile = load_personality(&ws);
+        let memory = profile
+            .files
+            .iter()
+            .find(|file| file.name == "MEMORY.md")
+            .unwrap();
+        assert_eq!(memory.content, "root memory");
+        assert!(memory.path.ends_with("MEMORY.md"));
+        assert!(!memory.path.ends_with("memory/MEMORY.md"));
 
         let _ = std::fs::remove_dir_all(ws);
     }
