@@ -76,6 +76,7 @@ mod tests {
             allowed_users: vec!["alice".into()],
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,

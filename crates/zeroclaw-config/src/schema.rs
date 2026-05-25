@@ -7188,6 +7188,9 @@ pub struct TelegramConfig {
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Delay (ms) between sending each paragraph in MultiMessage mode.
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
     /// When true, a newer Telegram message from the same sender in the same chat
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
@@ -12536,6 +12539,7 @@ auto_save = true
                     allowed_users: vec!["user1".into()],
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: default_draft_update_interval_ms(),
+                    multi_message_delay_ms: default_multi_message_delay_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
                     ack_reactions: None,
@@ -13441,6 +13445,7 @@ default_temperature = 0.7
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            multi_message_delay_ms: 800,
             interrupt_on_new_message: true,
             mention_only: false,
             ack_reactions: None,
@@ -13462,6 +13467,7 @@ default_temperature = 0.7
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert_eq!(parsed.multi_message_delay_ms, 800);
         assert!(!parsed.interrupt_on_new_message);
     }
 
@@ -16904,6 +16910,7 @@ require_otp_to_resume = true
             allowed_users: vec!["user1".into()],
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
