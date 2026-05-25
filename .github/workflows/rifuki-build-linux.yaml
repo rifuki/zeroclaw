@@ -1,0 +1,96 @@
+name: Rifuki Build ZeroClaw Linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/rifuki-build-wa-web-v075
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  TARGET: x86_64-unknown-linux-gnu
+  FEATURES: whatsapp-web
+  RELEASE_TAG: rifuki-latest
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rifuki-zeroclaw-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux AMD64 with WhatsApp Web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rifuki-zeroclaw-${{ env.TARGET }}-${{ env.FEATURES }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cargo web build
+
+      - name: Build release binary
+        run: cargo build --release --locked --features "${FEATURES}" --target "${TARGET}" --bin zeroclaw
+
+      - name: Package artifact
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifact/web
+          cp "target/${TARGET}/release/zeroclaw" artifact/zeroclaw
+          cp -r web/dist artifact/web/dist
+          strip artifact/zeroclaw
+          cat > artifact/version.json <<EOF
+          {
+            "version": "$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)",
+            "git_sha": "${GITHUB_SHA}",
+            "git_ref": "${GITHUB_REF_NAME}",
+            "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "target": "${TARGET}",
+            "features": "${FEATURES}",
+            "release_tag": "${RELEASE_TAG}"
+          }
+          EOF
+          tar -C artifact -czf "zeroclaw-${TARGET}-wa-web.tar.gz" zeroclaw web/dist version.json
+          sha256sum "zeroclaw-${TARGET}-wa-web.tar.gz" > SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-linux-amd64-wa-web
+          path: |
+            zeroclaw-${{ env.TARGET }}-wa-web.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish rolling release
+        if: github.repository == 'rifuki/zeroclaw'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          gh release delete "${RELEASE_TAG}" --yes --cleanup-tag || true
+          gh release create "${RELEASE_TAG}" \
+            --title "ZeroClaw Rifuki latest" \
+            --notes "Rolling Linux AMD64 build from ${GITHUB_SHA} with WhatsApp Web support and the channel media precheck hotfix." \
+            --prerelease \
+            "zeroclaw-${TARGET}-wa-web.tar.gz" \
+            SHA256SUMS
