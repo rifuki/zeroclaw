@@ -817,6 +817,152 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     }
 }
 
+fn parse_bare_shell_fast_path(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.contains('\n') {
+        return None;
+    }
+
+    // Keep this fast path intentionally narrow: one harmless informational
+    // command, no shell metacharacters, and at most a few simple arguments.
+    if trimmed.chars().any(|ch| {
+        matches!(
+            ch,
+            '|' | '&' | ';' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}'
+        )
+    }) {
+        return None;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() > 4 {
+        return None;
+    }
+
+    let command = tokens[0].to_ascii_lowercase();
+    let allowed = matches!(
+        command.as_str(),
+        "neofetch"
+            | "fastfetch"
+            | "screenfetch"
+            | "uname"
+            | "uptime"
+            | "date"
+            | "hostname"
+            | "whoami"
+            | "pwd"
+            | "df"
+            | "du"
+            | "free"
+    );
+    if !allowed {
+        return None;
+    }
+
+    if tokens[1..].iter().any(|arg| {
+        arg.is_empty()
+            || !arg.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '=' | '+')
+            })
+    }) {
+        return None;
+    }
+
+    if command == "neofetch" && tokens.len() == 1 {
+        Some("neofetch --stdout".to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn handle_bare_shell_fast_path_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    let Some(command) = parse_bare_shell_fast_path(&msg.content) else {
+        return false;
+    };
+
+    let Some(channel) = target_channel else {
+        return false;
+    };
+
+    let Some(shell_tool) = ctx
+        .tools_registry
+        .iter()
+        .find(|tool| tool.name() == "shell")
+    else {
+        tracing::debug!("Bare shell fast path skipped: shell tool unavailable");
+        return false;
+    };
+
+    let started_at = Instant::now();
+    tracing::info!(
+        channel = %msg.channel,
+        sender = %msg.sender,
+        command = %command,
+        "Executing bare shell fast path"
+    );
+
+    let result = shell_tool
+        .execute(serde_json::json!({ "command": command }))
+        .await;
+
+    let response = match result {
+        Ok(tool_result) if tool_result.success => {
+            if tool_result.output.trim().is_empty() {
+                "(no output)".to_string()
+            } else {
+                tool_result.output
+            }
+        }
+        Ok(tool_result) => {
+            let detail = tool_result
+                .error
+                .filter(|err| !err.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if tool_result.output.trim().is_empty() {
+                        "command failed without output".to_string()
+                    } else {
+                        tool_result.output
+                    }
+                });
+            format!("Command failed: {detail}")
+        }
+        Err(err) => format!("Command failed: {err}"),
+    };
+    let delivered = truncate_with_ellipsis(response.trim(), 3800);
+
+    let _ = channel
+        .send(&SendMessage::new(delivered, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await;
+
+    let history_key = conversation_history_key(msg);
+    append_sender_turn(ctx, &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(ctx, &history_key, ChatMessage::assistant(response.trim()));
+
+    runtime_trace::record_event(
+        "channel_message_bare_shell_fast_path",
+        Some(msg.channel.as_str()),
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+        serde_json::json!({
+            "sender": msg.sender,
+            "command": command,
+            "elapsed_ms": started_at.elapsed().as_millis(),
+        }),
+    );
+    println!(
+        "  ⚡ Fast shell reply ({}ms)",
+        started_at.elapsed().as_millis()
+    );
+    true
+}
+
 fn resolve_provider_alias(name: &str) -> Option<String> {
     let candidate = name.trim();
     if candidate.is_empty() {
@@ -2743,6 +2889,9 @@ async fn process_channel_message(
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_bare_shell_fast_path_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
 
@@ -6327,6 +6476,37 @@ mod tests {
             ),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn bare_shell_fast_path_maps_neofetch_to_stdout() {
+        assert_eq!(
+            parse_bare_shell_fast_path("neofetch").as_deref(),
+            Some("neofetch --stdout")
+        );
+    }
+
+    #[test]
+    fn bare_shell_fast_path_allows_simple_info_commands() {
+        assert_eq!(
+            parse_bare_shell_fast_path("df -h").as_deref(),
+            Some("df -h")
+        );
+        assert_eq!(
+            parse_bare_shell_fast_path("uname -a").as_deref(),
+            Some("uname -a")
+        );
+        assert_eq!(
+            parse_bare_shell_fast_path("free -h").as_deref(),
+            Some("free -h")
+        );
+    }
+
+    #[test]
+    fn bare_shell_fast_path_rejects_chains_and_non_info_commands() {
+        assert!(parse_bare_shell_fast_path("neofetch || uname -a").is_none());
+        assert!(parse_bare_shell_fast_path("curl https://example.com").is_none());
+        assert!(parse_bare_shell_fast_path("/start").is_none());
     }
 
     #[test]
