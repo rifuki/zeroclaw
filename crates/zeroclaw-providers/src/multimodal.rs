@@ -142,6 +142,16 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Replace media attachment markers with a plain-text placeholder for
+/// auxiliary model calls that do not need the media payload itself.
+pub fn strip_media_markers(text: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .unwrap()
+    });
+    RE.replace_all(text, "[media attachment]").into_owned()
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -598,6 +608,16 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn strip_media_markers_replaces_attachment_markers() {
+        let input = "please inspect [IMAGE:/tmp/a.png] and [voice:/tmp/a.ogg]";
+
+        assert_eq!(
+            strip_media_markers(input),
+            "please inspect [media attachment] and [media attachment]"
+        );
     }
 
     #[tokio::test]

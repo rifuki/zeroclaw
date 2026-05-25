@@ -2217,7 +2217,8 @@ async fn classify_channel_reply_intent(
             "assistant" => "assistant",
             _ => "user",
         };
-        let _ = writeln!(convo, "[{role}] {}", msg.content);
+        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(&msg.content);
+        let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
     let response = provider
