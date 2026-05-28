@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/rifuki-build-wa-web-v075
+      - rifuki/v0.8-migration
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
