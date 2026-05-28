@@ -1213,11 +1213,30 @@ impl Channel for WhatsAppWebChannel {
 
                                 let is_group = info.source.is_group;
 
-                                // Phone-based reply target for self-chat.
+                                // Phone-based reply target.
                                 // LID JIDs (e.g. 76188559093817@lid) are internal
                                 // identifiers that cannot receive messages; replies
                                 // must go to the phone JID (digits@s.whatsapp.net).
+                                // Convert for any non-group LID DM, not just self-chat.
                                 let mut reply_target = chat.clone();
+                                if !is_group && info.source.chat.is_lid() {
+                                    let phone_digits = normalized
+                                        .as_ref()
+                                        .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                                        .filter(|d| !d.is_empty())
+                                        .or_else(|| {
+                                            mapped_phone
+                                                .as_deref()
+                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                                                .filter(|d| !d.is_empty())
+                                        });
+                                    if let Some(digits) = phone_digits {
+                                        reply_target = format!("{digits}@s.whatsapp.net");
+                                        tracing::debug!(
+                                            "WhatsApp Web: LID→phone reply target: {reply_target}"
+                                        );
+                                    }
+                                }
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -1239,22 +1258,7 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                         // self_chat_mode=true: always process, skip further policy checks.
-                                        //
-                                        // When the chat JID is LID-based, replies
-                                        // won't be delivered. Convert to a phone
-                                        // JID so the reply shows up in the self-chat.
-                                        if info.source.chat.is_lid() {
-                                            let phone_digits = normalized
-                                                .as_ref()
-                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
-                                                .filter(|d| !d.is_empty());
-                                            if let Some(digits) = phone_digits {
-                                                reply_target = format!("{digits}@s.whatsapp.net");
-                                                tracing::debug!(
-                                                    "WhatsApp Web: self-chat LID→phone reply target: {reply_target}"
-                                                );
-                                            }
-                                        }
+                                        // (LID→phone conversion already handled above for all DMs.)
                                     } else if info.source.is_from_me
                                         && !fromme_outside_self_chat_is_operator_trigger(
                                             is_group,
