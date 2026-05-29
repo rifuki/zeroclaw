@@ -1384,7 +1384,7 @@ impl Channel for WhatsAppWebChannel {
                                 // Download image / video / document payloads so the
                                 // media pipeline can describe them to the agent.
                                 // Audio is already handled above via voice transcription.
-                                use whatsapp_rust::download::Downloadable;
+                                use wa_rs::download::Downloadable;
                                 let mut inbound_attachments: Vec<zeroclaw_api::media::MediaAttachment> = Vec::new();
 
                                 if let Some(ref img) = msg.image_message {
