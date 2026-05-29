@@ -1380,11 +1380,87 @@ impl Channel for WhatsAppWebChannel {
                                     text.trim().to_string()
                                 };
 
+                                // ── Inbound media attachment download ──
+                                // Download image / video / document payloads so the
+                                // media pipeline can describe them to the agent.
+                                // Audio is already handled above via voice transcription.
+                                use whatsapp_rust::download::Downloadable;
+                                let mut inbound_attachments: Vec<zeroclaw_api::media::MediaAttachment> = Vec::new();
+
+                                if let Some(ref img) = msg.image_message {
+                                    match client.download(img as &dyn Downloadable).await {
+                                        Ok(data) => {
+                                            let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
+                                            let ext = mime.split('/').nth(1).unwrap_or("jpg");
+                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
+                                                file_name: format!("image.{ext}"),
+                                                data,
+                                                mime_type: Some(mime),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("WhatsApp Web: failed to download image: {}", e);
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref vid) = msg.video_message {
+                                    match client.download(vid as &dyn Downloadable).await {
+                                        Ok(data) => {
+                                            let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
+                                            let ext = mime.split('/').nth(1).unwrap_or("mp4");
+                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
+                                                file_name: format!("video.{ext}"),
+                                                data,
+                                                mime_type: Some(mime),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("WhatsApp Web: failed to download video: {}", e);
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref doc) = msg.document_message {
+                                    match client.download(doc as &dyn Downloadable).await {
+                                        Ok(data) => {
+                                            let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+                                            let file_name = doc.file_name.clone()
+                                                .or_else(|| doc.title.clone())
+                                                .unwrap_or_else(|| "document".to_string());
+                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
+                                                file_name,
+                                                data,
+                                                mime_type: Some(mime),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("WhatsApp Web: failed to download document: {}", e);
+                                        }
+                                    }
+                                }
+
+                                // Build final content: if no text but we have media, use a
+                                // placeholder so the message is not silently dropped.
+                                let content = if content.is_empty() && !inbound_attachments.is_empty() {
+                                    let kinds: Vec<&str> = inbound_attachments.iter().map(|a| {
+                                        match a.mime_type.as_deref().unwrap_or("") {
+                                            m if m.starts_with("image/") => "[Image]",
+                                            m if m.starts_with("video/") => "[Video]",
+                                            _ => "[File]",
+                                        }
+                                    }).collect();
+                                    kinds.join(" ")
+                                } else {
+                                    content
+                                };
+
                                 tracing::info!(
-                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
+                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={}, attachments={})",
                                     sender.len(),
                                     chat.len(),
-                                    content.len()
+                                    content.len(),
+                                    inbound_attachments.len()
                                 );
                                 tracing::debug!(
                                     "WhatsApp Web message content: {}",
@@ -1471,7 +1547,7 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         interruption_scope_id: None,
-                    attachments: vec![],
+                                        attachments: inbound_attachments,
                                     })
                                     .await
                                 {
