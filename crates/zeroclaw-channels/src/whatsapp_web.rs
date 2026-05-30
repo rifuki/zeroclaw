@@ -584,6 +584,36 @@ impl WhatsAppWebChannel {
         {
             return ctx.mentioned_jid.clone();
         }
+        if let Some(ref img) = base.image_message
+            && let Some(ref ctx) = img.context_info
+            && !ctx.mentioned_jid.is_empty()
+        {
+            return ctx.mentioned_jid.clone();
+        }
+        if let Some(ref vid) = base.video_message
+            && let Some(ref ctx) = vid.context_info
+            && !ctx.mentioned_jid.is_empty()
+        {
+            return ctx.mentioned_jid.clone();
+        }
+        if let Some(ref doc) = base.document_message
+            && let Some(ref ctx) = doc.context_info
+            && !ctx.mentioned_jid.is_empty()
+        {
+            return ctx.mentioned_jid.clone();
+        }
+        if let Some(ref aud) = base.audio_message
+            && let Some(ref ctx) = aud.context_info
+            && !ctx.mentioned_jid.is_empty()
+        {
+            return ctx.mentioned_jid.clone();
+        }
+        if let Some(ref stk) = base.sticker_message
+            && let Some(ref ctx) = stk.context_info
+            && !ctx.mentioned_jid.is_empty()
+        {
+            return ctx.mentioned_jid.clone();
+        }
 
         Vec::new()
     }
