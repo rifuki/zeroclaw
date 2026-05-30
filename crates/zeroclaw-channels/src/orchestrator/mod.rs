@@ -772,7 +772,10 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "slack" | "whatsapp" | "whatsapp-web" | "whatsapp_web"
+    )
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {

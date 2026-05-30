@@ -1388,7 +1388,7 @@ impl Channel for WhatsAppWebChannel {
                                 let mut inbound_attachments: Vec<zeroclaw_api::media::MediaAttachment> = Vec::new();
 
                                 if let Some(ref img) = msg.image_message {
-                                    match client.download(img as &dyn Downloadable).await {
+                                    match client.download(img.as_ref() as &dyn Downloadable).await {
                                         Ok(data) => {
                                             let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
                                             let ext = mime.split('/').nth(1).unwrap_or("jpg");
@@ -1405,7 +1405,7 @@ impl Channel for WhatsAppWebChannel {
                                 }
 
                                 if let Some(ref vid) = msg.video_message {
-                                    match client.download(vid as &dyn Downloadable).await {
+                                    match client.download(vid.as_ref() as &dyn Downloadable).await {
                                         Ok(data) => {
                                             let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
                                             let ext = mime.split('/').nth(1).unwrap_or("mp4");
@@ -1422,7 +1422,7 @@ impl Channel for WhatsAppWebChannel {
                                 }
 
                                 if let Some(ref doc) = msg.document_message {
-                                    match client.download(doc as &dyn Downloadable).await {
+                                    match client.download(doc.as_ref() as &dyn Downloadable).await {
                                         Ok(data) => {
                                             let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
                                             let file_name = doc.file_name.clone()
