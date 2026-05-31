@@ -64,6 +64,8 @@ pub struct WhatsAppWebChannel {
     mention_only: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
+    /// Bot LID number (digits only), resolved from device identity at runtime
+    bot_lid: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: zeroclaw_config::schema::WhatsAppWebMode,
     /// DM policy when mode = personal
@@ -145,6 +147,7 @@ impl WhatsAppWebChannel {
             allowed_numbers,
             mention_only,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
+            bot_lid: Arc::new(Mutex::new(None)),
             mode,
             dm_policy,
             group_policy,
@@ -620,37 +623,53 @@ impl WhatsAppWebChannel {
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
     #[cfg(feature = "whatsapp-web")]
-    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str) -> bool {
-        // 1. Structured: check if any mentioned_jid's digits match the bot's phone digits
+    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str, bot_lid: Option<&str>) -> bool {
+        // 1. Structured: check if any mentioned_jid's digits match the bot's phone or LID digits
         for jid in mentioned_jids {
             let digits = Self::jid_digits(jid);
-            if !digits.is_empty() && digits == bot_phone {
-                return true;
+            if !digits.is_empty() {
+                if digits == bot_phone {
+                    return true;
+                }
+                if let Some(bl) = bot_lid {
+                    if digits == bl {
+                        return true;
+                    }
+                }
             }
         }
 
-        // 2. Text fallback: word-boundary-aware match for @<bot_digits>.
-        //    Scan all occurrences -- an earlier prefix false-match must not mask a later real mention.
-        let pattern = format!("@{bot_phone}");
-        let mut search_from = 0;
-        while let Some(rel_pos) = text[search_from..].find(&pattern) {
-            let pos = search_from + rel_pos;
-            let after_idx = pos + pattern.len();
-            // Leading boundary: @ must be preceded by whitespace or start-of-string
-            let leading_ok = pos == 0
-                || text[..pos]
+        // Helper for text mention match
+        let has_text_mention = |text: &str, pattern: &str| -> bool {
+            let mut search_from = 0;
+            while let Some(rel_pos) = text[search_from..].find(pattern) {
+                let pos = search_from + rel_pos;
+                let after_idx = pos + pattern.len();
+                let leading_ok = pos == 0
+                    || text[..pos]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+                let trailing_ok = text[after_idx..]
                     .chars()
-                    .next_back()
-                    .is_none_or(|ch| !ch.is_ascii_alphanumeric());
-            // Trailing boundary: character after digits must not be a digit
-            let trailing_ok = text[after_idx..]
-                .chars()
-                .next()
-                .is_none_or(|ch| !ch.is_ascii_digit());
-            if leading_ok && trailing_ok {
+                    .next()
+                    .is_none_or(|ch| !ch.is_ascii_digit());
+                if leading_ok && trailing_ok {
+                    return true;
+                }
+                search_from = after_idx;
+            }
+            false
+        };
+
+        if has_text_mention(text, &format!("@{bot_phone}")) {
+            return true;
+        }
+
+        if let Some(bl) = bot_lid {
+            if has_text_mention(text, &format!("@{bl}")) {
                 return true;
             }
-            search_from = after_idx;
         }
 
         false
@@ -659,37 +678,51 @@ impl WhatsAppWebChannel {
     /// Strip text-based @<bot_phone> mention from the message, collapse whitespace.
     /// Returns None if the result is empty after stripping.
     #[cfg(feature = "whatsapp-web")]
-    fn normalize_incoming_content(text: &str, bot_phone: &str) -> Option<String> {
-        let pattern = format!("@{bot_phone}");
-        let mut result = String::with_capacity(text.len());
-        let mut remaining = text;
+    fn normalize_incoming_content(text: &str, bot_phone: &str, bot_lid: Option<&str>) -> Option<String> {
+        let mut content = text.to_string();
 
-        while let Some(pos) = remaining.find(&pattern) {
-            let after = pos + pattern.len();
-            let leading_ok = pos == 0
-                || remaining[..pos]
+        let strip_pattern = |s: &mut String, pattern: &str| {
+            let mut result = String::with_capacity(s.len());
+            let mut remaining = s.as_str();
+
+            while let Some(pos) = remaining.find(pattern) {
+                let after = pos + pattern.len();
+                let leading_ok = pos == 0
+                    || remaining[..pos]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+                let trailing_ok = remaining[after..]
                     .chars()
-                    .next_back()
-                    .is_none_or(|ch| !ch.is_ascii_alphanumeric());
-            let trailing_ok = remaining[after..]
-                .chars()
-                .next()
-                .is_none_or(|ch| !ch.is_ascii_digit());
-            if leading_ok && trailing_ok {
-                result.push_str(&remaining[..pos]);
-                remaining = &remaining[after..];
-            } else {
-                result.push_str(&remaining[..after]);
-                remaining = &remaining[after..];
-            }
-        }
-        result.push_str(remaining);
+                    .next()
+                    .is_none_or(|ch| !ch.is_ascii_digit());
 
-        let normalized: String = result.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.is_empty() {
+                if leading_ok && trailing_ok {
+                    result.push_str(&remaining[..pos]);
+                    remaining = &remaining[after..];
+                } else {
+                    result.push_str(&remaining[..after]);
+                    remaining = &remaining[after..];
+                }
+            }
+            result.push_str(remaining);
+            *s = result;
+        };
+
+        strip_pattern(&mut content, &format!("@{bot_phone}"));
+        if let Some(bl) = bot_lid {
+            strip_pattern(&mut content, &format!("@{bl}"));
+        }
+
+        let cleaned: String = content
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ");
+
+        if cleaned.is_empty() {
             None
         } else {
-            Some(normalized)
+            Some(cleaned)
         }
     }
 
@@ -1165,6 +1198,18 @@ impl Channel for WhatsAppWebChannel {
                         );
                     }
                 }
+                if let Some(ref lid) = device.lid {
+                    let user = lid.user();
+                    let lid_base = user.split(':').next().unwrap_or(user);
+                    let digits: String = lid_base.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        *self.bot_lid.lock() = Some(digits.clone());
+                        tracing::info!(
+                            "WhatsApp Web: pre-resolved bot LID from saved session: {}",
+                            digits
+                        );
+                    }
+                }
             } else {
                 tracing::info!(
                     "WhatsApp Web: no existing session, new device will be created during pairing"
@@ -1201,6 +1246,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
+            let bot_lid_clone = self.bot_lid.clone();
             // Pre-populate bot identity from pair_phone config if present,
             // so group mention checks work before the Connected event fires.
             if let Some(ref pp) = self.pair_phone {
@@ -1238,6 +1284,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
                     let bot_phone_inner = bot_phone_clone.clone();
+                    let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
@@ -1537,13 +1584,17 @@ impl Channel for WhatsAppWebChannel {
                                 // mention_only: skip group messages without a bot mention
                                 let content = if mention_only && is_group {
                                     let bot_phone = bot_phone_inner.lock();
-                                    if let Some(ref bp) = *bot_phone {
+                                    let bot_lid = bot_lid_inner.lock();
+                                    if bot_phone.is_some() || bot_lid.is_some() {
                                         let mentioned_jids =
                                             Self::extract_mentioned_jids(&msg);
+                                        let bp = bot_phone.as_deref().unwrap_or("");
+                                        let bl = bot_lid.as_deref();
                                         if !Self::contains_bot_mention(
                                             &content,
                                             &mentioned_jids,
                                             bp,
+                                            bl,
                                         ) {
                                             tracing::debug!(
                                                 "WhatsApp Web: ignoring group message without bot mention"
@@ -1551,7 +1602,7 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                         match Self::normalize_incoming_content(
-                                            &content, bp,
+                                            &content, bp, bl,
                                         ) {
                                             Some(c) => c,
                                             None => {
@@ -1588,17 +1639,31 @@ impl Channel for WhatsAppWebChannel {
                                         None => {
                                             let was_structurally_mentioned = if is_group {
                                                 let bot_phone = bot_phone_inner.lock();
-                                                if let Some(ref bp) = *bot_phone {
-                                                    let mentioned_jids = Self::extract_mentioned_jids(&msg);
-                                                    mentioned_jids.iter().any(|jid| {
-                                                        let digits = Self::jid_digits(jid);
-                                                        !digits.is_empty() && digits == *bp
-                                                    })
-                                                } else {
+                                                let bot_lid = bot_lid_inner.lock();
+                                                if bot_phone.is_none() && bot_lid.is_none() {
                                                     // bot identity not yet known; allow media messages
                                                     // through so the user gets a response even if we
                                                     // can't verify the structured JID mention.
                                                     !inbound_attachments.is_empty()
+                                                } else {
+                                                    let mentioned_jids = Self::extract_mentioned_jids(&msg);
+                                                    mentioned_jids.iter().any(|jid| {
+                                                        let digits = Self::jid_digits(jid);
+                                                        if digits.is_empty() {
+                                                            return false;
+                                                        }
+                                                        if let Some(ref bp) = *bot_phone {
+                                                            if digits == *bp {
+                                                                return true;
+                                                            }
+                                                        }
+                                                        if let Some(ref bl) = *bot_lid {
+                                                            if digits == *bl {
+                                                                return true;
+                                                            }
+                                                        }
+                                                        false
+                                                    })
                                                 }
                                             } else {
                                                 true
@@ -1657,6 +1722,21 @@ impl Channel for WhatsAppWebChannel {
                                         *bot_phone_inner.lock() = Some(digits.clone());
                                         tracing::info!(
                                             "WhatsApp Web: resolved bot identity from device: +{}",
+                                            digits
+                                        );
+                                    }
+                                }
+                                if let Some(ref lid) = device.lid {
+                                    let user = lid.user();
+                                    let lid_base = user.split(':').next().unwrap_or(user);
+                                    let digits: String = lid_base
+                                        .chars()
+                                        .filter(|c: &char| c.is_ascii_digit())
+                                        .collect();
+                                    if !digits.is_empty() {
+                                        *bot_lid_inner.lock() = Some(digits.clone());
+                                        tracing::info!(
+                                            "WhatsApp Web: resolved bot LID from device: {}",
                                             digits
                                         );
                                     }
