@@ -443,12 +443,26 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
+    let is_wa_group = msg.channel == "whatsapp" && msg.reply_target.contains("@g.us");
+
     match &msg.thread_ts {
-        Some(tid) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(tid) => {
+            if is_wa_group {
+                format!("{}_{}_{}", msg.channel, msg.reply_target, tid)
+            } else {
+                format!(
+                    "{}_{}_{}_{}",
+                    msg.channel, msg.reply_target, tid, msg.sender
+                )
+            }
+        }
+        None => {
+            if is_wa_group {
+                format!("{}_{}", msg.channel, msg.reply_target)
+            } else {
+                format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+            }
+        }
     }
 }
 
@@ -457,12 +471,26 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    let is_wa_group = msg.channel == "whatsapp" && msg.reply_target.contains("@g.us");
+
     match &msg.interruption_scope_id {
-        Some(scope) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(scope) => {
+            if is_wa_group {
+                format!("{}_{}_{}", msg.channel, msg.reply_target, scope)
+            } else {
+                format!(
+                    "{}_{}_{}_{}",
+                    msg.channel, msg.reply_target, msg.sender, scope
+                )
+            }
+        }
+        None => {
+            if is_wa_group {
+                format!("{}_{}", msg.channel, msg.reply_target)
+            } else {
+                format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+            }
+        }
     }
 }
 

@@ -1406,7 +1406,10 @@ impl Channel for WhatsAppWebChannel {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
                                     }
-                                    let text = msg.text_content().unwrap_or("");
+                                    use wa_rs_core::proto_helpers::MessageExt;
+                                    let text = msg.text_content()
+                                        .or_else(|| msg.get_caption())
+                                        .unwrap_or("");
                                     text.trim().to_string()
                                 };
 
@@ -1557,10 +1560,29 @@ impl Channel for WhatsAppWebChannel {
                                     ) {
                                         Some(c) => c,
                                         None => {
-                                            tracing::debug!(
-                                                "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
-                                            );
-                                            return;
+                                            let was_structurally_mentioned = if is_group {
+                                                let bot_phone = bot_phone_inner.lock();
+                                                if let Some(ref bp) = *bot_phone {
+                                                    let mentioned_jids = Self::extract_mentioned_jids(&msg);
+                                                    mentioned_jids.iter().any(|jid| {
+                                                        let digits = Self::jid_digits(jid);
+                                                        !digits.is_empty() && digits == *bp
+                                                    })
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                true
+                                            };
+
+                                            if was_structurally_mentioned {
+                                                content
+                                            } else {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
+                                                );
+                                                return;
+                                            }
                                         }
                                     };
 
