@@ -1151,6 +1151,20 @@ impl Channel for WhatsAppWebChannel {
                 } else {
                     anyhow::bail!("Device exists but failed to load");
                 }
+                // Resolve bot identity from the loaded device immediately so that
+                // group mention gating works before the Connected event fires.
+                if let Some(ref pn) = device.pn {
+                    let phone = pn.user();
+                    let phone_base = phone.split(':').next().unwrap_or(phone);
+                    let digits: String = phone_base.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        *self.bot_phone.lock() = Some(digits.clone());
+                        tracing::info!(
+                            "WhatsApp Web: pre-resolved bot identity from saved session: +{}",
+                            digits
+                        );
+                    }
+                }
             } else {
                 tracing::info!(
                     "WhatsApp Web: no existing session, new device will be created during pairing"
@@ -1187,6 +1201,18 @@ impl Channel for WhatsAppWebChannel {
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
+            // Pre-populate bot identity from pair_phone config if present,
+            // so group mention checks work before the Connected event fires.
+            if let Some(ref pp) = self.pair_phone {
+                let digits: String = pp.chars().filter(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty() {
+                    *bot_phone_clone.lock() = Some(digits.clone());
+                    tracing::info!(
+                        "WhatsApp Web: pre-resolved bot identity from pair_phone config: +{}",
+                        digits
+                    );
+                }
+            }
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
@@ -1569,7 +1595,10 @@ impl Channel for WhatsAppWebChannel {
                                                         !digits.is_empty() && digits == *bp
                                                     })
                                                 } else {
-                                                    false
+                                                    // bot identity not yet known; allow media messages
+                                                    // through so the user gets a response even if we
+                                                    // can't verify the structured JID mention.
+                                                    !inbound_attachments.is_empty()
                                                 }
                                             } else {
                                                 true
@@ -1616,7 +1645,11 @@ impl Channel for WhatsAppWebChannel {
                                     .await;
                                 if let Some(ref pn) = device.pn {
                                     let phone = pn.user();
-                                    let digits: String = phone
+                                    // JID user() may include a device index suffix like "6287778315246:16".
+                                    // Strip the ":N" part before extracting digits so we get the bare
+                                    // phone number without the device suffix.
+                                    let phone_base = phone.split(':').next().unwrap_or(phone);
+                                    let digits: String = phone_base
                                         .chars()
                                         .filter(|c: &char| c.is_ascii_digit())
                                         .collect();
