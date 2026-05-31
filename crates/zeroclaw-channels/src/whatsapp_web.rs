@@ -1610,24 +1610,22 @@ impl Channel for WhatsAppWebChannel {
                                 tracing::info!("WhatsApp Web connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 // Resolve bot identity from the device store
-                                if mention_only {
-                                    let device = client
-                                        .persistence_manager()
-                                        .get_device_snapshot()
-                                        .await;
-                                    if let Some(ref pn) = device.pn {
-                                        let phone = pn.user();
-                                        let digits: String = phone
-                                            .chars()
-                                            .filter(|c: &char| c.is_ascii_digit())
-                                            .collect();
-                                        if !digits.is_empty() {
-                                            *bot_phone_inner.lock() = Some(digits.clone());
-                                            tracing::info!(
-                                                "WhatsApp Web: resolved bot identity from device: +{}",
-                                                digits
-                                            );
-                                        }
+                                let device = client
+                                    .persistence_manager()
+                                    .get_device_snapshot()
+                                    .await;
+                                if let Some(ref pn) = device.pn {
+                                    let phone = pn.user();
+                                    let digits: String = phone
+                                        .chars()
+                                        .filter(|c: &char| c.is_ascii_digit())
+                                        .collect();
+                                    if !digits.is_empty() {
+                                        *bot_phone_inner.lock() = Some(digits.clone());
+                                        tracing::info!(
+                                            "WhatsApp Web: resolved bot identity from device: +{}",
+                                            digits
+                                        );
                                     }
                                 }
                             }
