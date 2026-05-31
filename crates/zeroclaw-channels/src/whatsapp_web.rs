@@ -2366,12 +2366,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2382,12 +2384,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2398,12 +2402,14 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "91921191606"
+            "91921191606",
+            None
         ));
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @155512345678",
             &no_jids,
-            "15551234567"
+            "15551234567",
+            None
         ));
     }
 
@@ -2414,7 +2420,8 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "just a regular message",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2425,7 +2432,8 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "@9192119160691 real @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2436,7 +2444,20 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "foo@919211916069 bar",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_matches_lid() {
+        let jids = vec!["227728477442093@lid".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @Doloris check this",
+            &jids,
+            "6287778315246",
+            Some("227728477442093")
         ));
     }
 
@@ -2446,7 +2467,8 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_incoming_content(
                 "@919211916069 what's the weather?",
-                "919211916069"
+                "919211916069",
+                None
             ),
             Some("what's the weather?".to_string())
         );
@@ -2458,7 +2480,8 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_incoming_content(
                 "@919211916069 hey @919211916069 hello",
-                "919211916069"
+                "919211916069",
+                None
             ),
             Some("hey hello".to_string())
         );
@@ -2468,7 +2491,7 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn normalize_incoming_content_returns_none_for_empty() {
         assert_eq!(
-            WhatsAppWebChannel::normalize_incoming_content("@919211916069", "919211916069"),
+            WhatsAppWebChannel::normalize_incoming_content("@919211916069", "919211916069", None),
             None
         );
     }
@@ -2477,7 +2500,7 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn normalize_incoming_content_preserves_prefix_match() {
         assert_eq!(
-            WhatsAppWebChannel::normalize_incoming_content("@155512345678 hello", "15551234567"),
+            WhatsAppWebChannel::normalize_incoming_content("@155512345678 hello", "15551234567", None),
             Some("@155512345678 hello".to_string())
         );
     }
@@ -2488,7 +2511,8 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_incoming_content(
                 "foo@919211916069 hello",
-                "919211916069"
+                "919211916069",
+                None
             ),
             Some("foo@919211916069 hello".to_string())
         );
