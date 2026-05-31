@@ -518,6 +518,13 @@ impl TelegramChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
                 self.transcription = Some(config);
             }
