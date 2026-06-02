@@ -1690,6 +1690,61 @@ fn content_has_image_markers(content: &str) -> bool {
     zeroclaw_providers::multimodal::count_image_markers(&[ChatMessage::user(content)]) > 0
 }
 
+fn channel_history_content_for_user_turn(content: &str) -> String {
+    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+    if image_refs.is_empty() {
+        return content.to_string();
+    }
+
+    let mut cleaned = cleaned.trim().to_string();
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+
+    if cleaned.is_empty() {
+        "[Image attachment processed by vision model]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn restore_current_user_turn_media_payload(
+    turns: &mut [ChatMessage],
+    history_content: &str,
+    full_content: &str,
+) {
+    if history_content == full_content {
+        return;
+    }
+
+    if let Some(turn) = turns
+        .iter_mut()
+        .rev()
+        .find(|turn| turn.role == "user" && turn.content == history_content)
+    {
+        turn.content = full_content.to_string();
+    }
+}
+
+fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+    if turns.len() <= 1 {
+        return;
+    }
+
+    let last_idx = turns.len() - 1;
+    for turn in &mut turns[..last_idx] {
+        if turn.content.contains("[IMAGE:") {
+            turn.content = channel_history_content_for_user_turn(&turn.content);
+        }
+    }
+
+    let current = turns.pop();
+    turns.retain(|turn| !turn.content.trim().is_empty());
+    if let Some(current) = current {
+        turns.push(current);
+    }
+}
+
 fn should_force_vision_route(
     content: &str,
     multimodal: &zeroclaw_config::schema::MultimodalConfig,
@@ -3018,16 +3073,18 @@ async fn process_channel_message(
             return;
         }
     };
+    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+
     if ctx.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
+        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &msg.content,
+                &history_user_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -3073,11 +3130,16 @@ async fn process_channel_message(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    // Preserve a compact user turn before the LLM call so interrupted requests
+    // keep context without persisting inline image payloads into future turns.
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&history_user_content),
+    );
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
+    let mut prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&msg.content)]
     } else {
         ctx.conversation_histories
@@ -3087,6 +3149,13 @@ async fn process_channel_message(
             .cloned()
             .unwrap_or_default()
     };
+    if !force_fresh_session {
+        restore_current_user_turn_media_payload(
+            &mut prior_turns_raw,
+            &history_user_content,
+            &msg.content,
+        );
+    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -3106,29 +3175,10 @@ async fn process_channel_message(
         }
     }
 
-    // Strip [IMAGE:] markers from *older* history messages when the active
-    // provider does not support vision. This prevents "history poisoning"
-    // where a previously-sent image marker gets reloaded from the JSONL
-    // session file and permanently breaks the conversation (fixes #3674).
-    // We skip the last turn (the current message) so the vision check can
-    // still reject fresh image sends with a proper error.
-    if !active_provider.supports_vision() && prior_turns.len() > 1 {
-        let last_idx = prior_turns.len() - 1;
-        for turn in &mut prior_turns[..last_idx] {
-            if turn.content.contains("[IMAGE:") {
-                let (cleaned, _refs) =
-                    zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
-                turn.content = cleaned;
-            }
-        }
-        // Drop older turns that became empty after marker removal (e.g. image-only messages).
-        // Keep the last turn (current message) intact.
-        let current = prior_turns.pop();
-        prior_turns.retain(|turn| !turn.content.trim().is_empty());
-        if let Some(current) = current {
-            prior_turns.push(current);
-        }
-    }
+    // Strip [IMAGE:] markers from *older* history messages before context
+    // compression. The current message keeps its full payload so vision still
+    // works for the active turn; historical turns keep only compact annotations.
+    strip_historical_image_payloads(&mut prior_turns);
 
     // Proactively trim conversation history before sending to the provider
     // to prevent context-window-exceeded errors (bug #3460).
@@ -4032,7 +4082,7 @@ async fn process_channel_message(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &history_user_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -7639,6 +7689,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -7666,6 +7717,10 @@ BTC is currently around $65,000 based on latest tool output."#
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
 
@@ -11726,6 +11781,130 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider {
+            vision: true,
+            ..Default::default()
+        });
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "sticker.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let current_user = calls[0]
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .expect("provider call should include current user message");
+        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        assert!(current_user.1.contains("please inspect this"));
+        drop(calls);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek("test-channel_chat-image_alice")
+            .expect("history should be stored for sender");
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.contains("[Image: sticker.png attached"));
+        assert!(turns[0].content.contains("please inspect this"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("AQIDBA"));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -13552,6 +13731,53 @@ This is an example JSON object for profile settings."#;
             "[Image: sticker attached]\n[IMAGE:data:image/webp;base64,abcd]",
             &multimodal
         ));
+    }
+
+    #[test]
+    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
+        let content =
+            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
+
+        let history_content = channel_history_content_for_user_turn(content);
+
+        assert_eq!(
+            history_content,
+            "[Image: sticker.webp attached]\n\nwhat is this?"
+        );
+        assert!(!history_content.contains("[IMAGE:data:"));
+        assert!(!history_content.contains("abcd"));
+    }
+
+    #[test]
+    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
+        let history_content =
+            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
+
+        assert_eq!(
+            history_content,
+            "[Image attachment processed by vision model]"
+        );
+    }
+
+    #[test]
+    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+        let mut turns = vec![
+            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
+            ChatMessage::assistant("I saw the old image."),
+            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+        ];
+
+        strip_historical_image_payloads(&mut turns);
+
+        assert_eq!(turns.len(), 3);
+        assert!(turns[0].content.contains("[Image: old.png attached]"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("base64,old"));
+        assert!(
+            turns[2]
+                .content
+                .contains("[IMAGE:data:image/png;base64,current]")
+        );
     }
 
     #[test]
