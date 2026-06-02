@@ -725,6 +725,9 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Override whether the provider supports multimodal image input.
+    /// `None` honors the provider's built-in choice.
+    pub vision: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +746,7 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            vision: None,
         }
     }
 }
@@ -787,6 +791,7 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        vision: fallback.and_then(|e| e.vision),
     }
 }
 
@@ -1158,6 +1163,7 @@ fn create_provider_with_url_and_options(
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
+        let vision = options.vision;
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1174,6 +1180,9 @@ fn create_provider_with_url_and_options(
             }
             if let Some(mt) = max_tokens {
                 p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(vision) = vision {
+                p = p.with_vision_support(vision);
             }
             Box::new(p)
         }
@@ -3303,6 +3312,42 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active provider profile to runtime options"
+        );
+    }
+
+    #[test]
+    fn factory_custom_honors_vision_override_false() {
+        let options = ProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let provider =
+            create_provider_with_options("custom:https://example.com/v1", Some("key"), &options)
+                .expect("custom provider factory must succeed");
+
+        assert!(
+            !provider.supports_vision(),
+            "custom OpenAI-compatible gateways must honor `vision = false`"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_vision() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.insert(
+            "custom:https://example.com/v1".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                vision: Some(false),
+                ..Default::default()
+            },
+        );
+        config.providers.fallback = Some("custom:https://example.com/v1".to_string());
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.vision,
+            Some(false),
+            "vision must propagate from the active provider profile to runtime options"
         );
     }
 

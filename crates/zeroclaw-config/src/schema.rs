@@ -620,6 +620,12 @@ pub struct ModelProviderConfig {
     /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Override the provider's default for multimodal image input.
+    /// `None` (default) honors the provider's built-in choice. `Some(false)`
+    /// keeps text-only OpenAI-compatible gateways from receiving image parts;
+    /// `Some(true)` enables image parts for custom gateways that support them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────

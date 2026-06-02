@@ -280,6 +280,12 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Override whether this OpenAI-compatible endpoint supports image input.
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
+    }
+
     /// Merge all system messages into the first user message before sending.
     /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
     pub fn with_merge_system_into_user(mut self) -> Self {
