@@ -1677,6 +1677,26 @@ fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>) -> Strin
     }
 }
 
+fn dedicated_vision_provider_configured(
+    multimodal: &zeroclaw_config::schema::MultimodalConfig,
+) -> bool {
+    multimodal
+        .vision_provider
+        .as_deref()
+        .is_some_and(|provider| !provider.trim().is_empty())
+}
+
+fn content_has_image_markers(content: &str) -> bool {
+    zeroclaw_providers::multimodal::count_image_markers(&[ChatMessage::user(content)]) > 0
+}
+
+fn should_force_vision_route(
+    content: &str,
+    multimodal: &zeroclaw_config::schema::MultimodalConfig,
+) -> bool {
+    content_has_image_markers(content) && dedicated_vision_provider_configured(multimodal)
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
@@ -2877,7 +2897,8 @@ async fn process_channel_message(
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = ctx.provider.supports_vision();
+        let vision =
+            ctx.provider.supports_vision() || dedicated_vision_provider_configured(&ctx.multimodal);
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             &ctx.transcription_config,
@@ -2953,13 +2974,32 @@ async fn process_channel_message(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut active_provider = match get_or_create_provider(
-        ctx.as_ref(),
-        &route.provider,
-        route.api_key.as_deref(),
-    )
-    .await
-    {
+    let force_vision_route = should_force_vision_route(&msg.content, &ctx.multimodal);
+    if force_vision_route && let Some(vision_provider) = ctx.multimodal.vision_provider.as_deref() {
+        route.provider = vision_provider.to_string();
+        if let Some(vision_model) = ctx.multimodal.vision_model.as_deref()
+            && !vision_model.trim().is_empty()
+        {
+            route.model = vision_model.to_string();
+        }
+        route.api_key = None;
+    }
+
+    let mut active_provider = match if force_vision_route {
+        let mut options = ctx.provider_runtime_options.clone();
+        options.vision = Some(true);
+        create_resilient_provider_nonblocking(
+            &route.provider,
+            ctx.api_key.clone(),
+            ctx.api_url.clone(),
+            ctx.reliability.as_ref().clone(),
+            options,
+        )
+        .await
+        .map(Arc::from)
+    } else {
+        get_or_create_provider(ctx.as_ref(), &route.provider, route.api_key.as_deref()).await
+    } {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
@@ -13490,6 +13530,28 @@ This is an example JSON object for profile settings."#;
             conversation_history_key(&group_a_msg),
             conversation_history_key(&group_b_msg)
         );
+    }
+
+    #[test]
+    fn should_force_vision_route_requires_image_marker_and_provider() {
+        let mut multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+
+        assert!(!should_force_vision_route(
+            "[IMAGE:data:image/webp;base64,abcd]",
+            &multimodal
+        ));
+
+        multimodal.vision_provider = Some("custom:https://example.com/v1".to_string());
+        multimodal.vision_model = Some("vision-model".to_string());
+
+        assert!(!should_force_vision_route(
+            "plain sticker note",
+            &multimodal
+        ));
+        assert!(should_force_vision_route(
+            "[Image: sticker attached]\n[IMAGE:data:image/webp;base64,abcd]",
+            &multimodal
+        ));
     }
 
     #[test]
