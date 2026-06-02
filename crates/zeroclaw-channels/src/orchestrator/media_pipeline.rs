@@ -13,6 +13,7 @@
 //! The pipeline is **opt-in** via `[media_pipeline] enabled = true` in config.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::borrow::Cow;
 use zeroclaw_config::schema::{MediaPipelineConfig, TranscriptionConfig};
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
@@ -135,8 +136,8 @@ impl<'a> MediaPipeline<'a> {
     /// knows an image is present.
     fn process_image(&self, attachment: &MediaAttachment) -> String {
         if self.vision_available {
-            let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
-            let b64 = STANDARD.encode(&attachment.data);
+            let (mime, data) = image_payload_for_vision(attachment);
+            let b64 = STANDARD.encode(data.as_ref());
             format!(
                 "[Image: {} attached, will be processed by vision model]\n[IMAGE:data:{};base64,{}]",
                 attachment.file_name, mime, b64
@@ -180,6 +181,44 @@ impl<'a> MediaPipeline<'a> {
             )
         }
     }
+}
+
+fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
+    let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
+
+    #[cfg(feature = "image-normalization")]
+    if is_webp_attachment(attachment, mime) {
+        match webp_to_png(&attachment.data) {
+            Ok(png) => return ("image/png".to_string(), Cow::Owned(png)),
+            Err(err) => {
+                tracing::warn!(
+                    file = %attachment.file_name,
+                    error = %err,
+                    error_key = "media_pipeline_webp_to_png_failed",
+                    "Media pipeline: failed to normalize WebP image for vision"
+                );
+            }
+        }
+    }
+
+    (mime.to_string(), Cow::Borrowed(&attachment.data))
+}
+
+#[cfg(feature = "image-normalization")]
+fn is_webp_attachment(attachment: &MediaAttachment, mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("image/webp")
+        || attachment
+            .file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("webp"))
+}
+
+#[cfg(feature = "image-normalization")]
+fn webp_to_png(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let image = image::load_from_memory_with_format(data, image::ImageFormat::WebP)?;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
 }
 
 #[cfg(test)]
@@ -313,7 +352,36 @@ mod tests {
             result.contains("[Image: photo.jpg attached, will be processed by vision model]"),
             "expected vision annotation, got: {result}"
         );
+        assert!(result.contains("[IMAGE:data:image/jpeg;base64,"));
         assert!(result.contains("check this"));
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn webp_image_is_normalized_to_png_for_vision() {
+        let config = default_pipeline_config(true);
+        let tc = TranscriptionConfig::default();
+        let pipeline = MediaPipeline::new(&config, &tc, true);
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let webp = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        webp.write_to(&mut cursor, image::ImageFormat::WebP)
+            .expect("test WebP should encode");
+
+        let sticker = MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data: cursor.into_inner(),
+            mime_type: Some("image/webp".to_string()),
+        };
+
+        let result = pipeline.process("what is this?", &[sticker]).await;
+
+        assert!(result.contains("[IMAGE:data:image/png;base64,"));
+        assert!(!result.contains("[IMAGE:data:image/webp;base64,"));
+        assert!(result.contains("what is this?"));
     }
 
     #[tokio::test]
