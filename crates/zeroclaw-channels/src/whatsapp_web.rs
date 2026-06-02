@@ -840,6 +840,41 @@ impl WhatsAppWebChannel {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn has_sticker_message(msg: &wa_rs_proto::whatsapp::Message) -> bool {
+        use wa_rs_core::proto_helpers::MessageExt;
+        msg.get_base_message().sticker_message.is_some()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_content_for_empty_media(
+        content: String,
+        inbound_attachments: &[zeroclaw_api::media::MediaAttachment],
+        has_sticker: bool,
+    ) -> String {
+        if !content.is_empty() {
+            return content;
+        }
+
+        if !inbound_attachments.is_empty() {
+            let kinds: Vec<&str> = inbound_attachments
+                .iter()
+                .map(|a| match a.mime_type.as_deref().unwrap_or("") {
+                    m if m.starts_with("image/") => "[Image]",
+                    m if m.starts_with("video/") => "[Video]",
+                    _ => "[File]",
+                })
+                .collect();
+            return kinds.join(" ");
+        }
+
+        if has_sticker {
+            return "[Sticker]".to_string();
+        }
+
+        content
+    }
+
     /// Upload a local file and send it as a native WhatsApp media message.
     #[cfg(feature = "whatsapp-web")]
     #[allow(dead_code)] // WIP: not yet wired into send path
@@ -1665,18 +1700,11 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Build final content: if no text but we have media, use a
                                 // placeholder so the message is not silently dropped.
-                                let content = if content.is_empty() && !inbound_attachments.is_empty() {
-                                    let kinds: Vec<&str> = inbound_attachments.iter().map(|a| {
-                                        match a.mime_type.as_deref().unwrap_or("") {
-                                            m if m.starts_with("image/") => "[Image]",
-                                            m if m.starts_with("video/") => "[Video]",
-                                            _ => "[File]",
-                                        }
-                                    }).collect();
-                                    kinds.join(" ")
-                                } else {
-                                    content
-                                };
+                                let content = Self::fallback_content_for_empty_media(
+                                    content,
+                                    &inbound_attachments,
+                                    Self::has_sticker_message(&msg),
+                                );
 
                                 tracing::info!(
                                     "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={}, attachments={})",
@@ -2751,6 +2779,58 @@ mod tests {
                 None
             ),
             Some("foo@919211916069 hello".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn has_sticker_message_detects_stickers() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            sticker_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::StickerMessage::default(),
+            )),
+            ..Default::default()
+        };
+
+        assert!(WhatsAppWebChannel::has_sticker_message(&msg));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_bot_matches_sticker_context() {
+        let msg = wa_rs_proto::whatsapp::Message {
+            sticker_message: Some(Box::new(wa_rs_proto::whatsapp::message::StickerMessage {
+                context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                    participant: Some("6287778315246@s.whatsapp.net".to_string()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        assert!(WhatsAppWebChannel::is_reply_to_bot(
+            &msg,
+            Some("6287778315246"),
+            None,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_content_for_empty_media_describes_sticker() {
+        assert_eq!(
+            WhatsAppWebChannel::fallback_content_for_empty_media(String::new(), &[], true,),
+            "[Sticker]"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_content_for_empty_media_preserves_text() {
+        assert_eq!(
+            WhatsAppWebChannel::fallback_content_for_empty_media("hello".to_string(), &[], true,),
+            "hello"
         );
     }
 
