@@ -621,6 +621,71 @@ impl WhatsAppWebChannel {
         Vec::new()
     }
 
+    /// Extract the quoted participant JID from the message's context_info, if present.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_participant(msg: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message
+            && let Some(ref ctx) = ext.context_info
+        {
+            return ctx.participant.clone();
+        }
+        if let Some(ref img) = base.image_message
+            && let Some(ref ctx) = img.context_info
+        {
+            return ctx.participant.clone();
+        }
+        if let Some(ref vid) = base.video_message
+            && let Some(ref ctx) = vid.context_info
+        {
+            return ctx.participant.clone();
+        }
+        if let Some(ref doc) = base.document_message
+            && let Some(ref ctx) = doc.context_info
+        {
+            return ctx.participant.clone();
+        }
+        if let Some(ref aud) = base.audio_message
+            && let Some(ref ctx) = aud.context_info
+        {
+            return ctx.participant.clone();
+        }
+        if let Some(ref stk) = base.sticker_message
+            && let Some(ref ctx) = stk.context_info
+        {
+            return ctx.participant.clone();
+        }
+
+        None
+    }
+
+    /// Check if the message is a reply to the bot.
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_bot(
+        msg: &wa_rs_proto::whatsapp::Message,
+        bot_phone: Option<&str>,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        if let Some(participant) = Self::extract_quoted_participant(msg) {
+            let digits = Self::jid_digits(&participant);
+            if !digits.is_empty() {
+                if let Some(bp) = bot_phone {
+                    if digits == bp {
+                        return true;
+                    }
+                }
+                if let Some(bl) = bot_lid {
+                    if digits == bl {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
     #[cfg(feature = "whatsapp-web")]
     fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str, bot_lid: Option<&str>) -> bool {
@@ -1590,12 +1655,13 @@ impl Channel for WhatsAppWebChannel {
                                             Self::extract_mentioned_jids(&msg);
                                         let bp = bot_phone.as_deref().unwrap_or("");
                                         let bl = bot_lid.as_deref();
-                                        if !Self::contains_bot_mention(
+                                        let is_mentioned = Self::contains_bot_mention(
                                             &content,
                                             &mentioned_jids,
                                             bp,
                                             bl,
-                                        ) {
+                                        ) || Self::is_reply_to_bot(&msg, bot_phone.as_deref(), bl);
+                                        if !is_mentioned {
                                             tracing::debug!(
                                                 "WhatsApp Web: ignoring group message without bot mention"
                                             );
@@ -1647,20 +1713,21 @@ impl Channel for WhatsAppWebChannel {
                                                     !inbound_attachments.is_empty()
                                                 } else {
                                                     let mentioned_jids = Self::extract_mentioned_jids(&msg);
-                                                    mentioned_jids.iter().any(|jid| {
+                                                    let is_reply = Self::is_reply_to_bot(&msg, bot_phone.as_deref(), bot_lid.as_deref());
+                                                    is_reply || mentioned_jids.iter().any(|jid| {
                                                         let digits = Self::jid_digits(jid);
                                                         if digits.is_empty() {
-                                                            return false;
+                                                             return false;
                                                         }
                                                         if let Some(ref bp) = *bot_phone {
-                                                            if digits == *bp {
-                                                                return true;
-                                                            }
+                                                             if digits == *bp {
+                                                                 return true;
+                                                             }
                                                         }
                                                         if let Some(ref bl) = *bot_lid {
-                                                            if digits == *bl {
-                                                                return true;
-                                                            }
+                                                             if digits == *bl {
+                                                                 return true;
+                                                             }
                                                         }
                                                         false
                                                     })
