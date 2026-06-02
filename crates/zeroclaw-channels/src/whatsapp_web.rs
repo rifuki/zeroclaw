@@ -30,11 +30,14 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_ATTACHMENT_SAVE_SUBDIR: &str = "whatsapp_files";
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -100,6 +103,8 @@ pub struct WhatsAppWebChannel {
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     group_mention_patterns: Arc<Vec<regex::Regex>>,
+    /// Workspace directory used to persist inbound WhatsApp media for tools.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl WhatsAppWebChannel {
@@ -166,7 +171,14 @@ impl WhatsAppWebChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
+            workspace_dir: None,
         }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -875,6 +887,275 @@ impl WhatsAppWebChannel {
         content
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_context_info(
+        msg: &wa_rs_proto::whatsapp::Message,
+    ) -> Option<&wa_rs_proto::whatsapp::ContextInfo> {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message {
+            return ext.context_info.as_deref();
+        }
+        if let Some(ref img) = base.image_message {
+            return img.context_info.as_deref();
+        }
+        if let Some(ref vid) = base.video_message {
+            return vid.context_info.as_deref();
+        }
+        if let Some(ref doc) = base.document_message {
+            return doc.context_info.as_deref();
+        }
+        if let Some(ref aud) = base.audio_message {
+            return aud.context_info.as_deref();
+        }
+        if let Some(ref stk) = base.sticker_message {
+            return stk.context_info.as_deref();
+        }
+
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message(
+        msg: &wa_rs_proto::whatsapp::Message,
+    ) -> Option<&wa_rs_proto::whatsapp::Message> {
+        Self::extract_context_info(msg)?.quoted_message.as_deref()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
+        let basename = Path::new(file_name).file_name()?.to_str()?.trim();
+        if basename.is_empty() || basename == "." || basename == ".." {
+            return None;
+        }
+
+        let mut sanitized = String::with_capacity(basename.len());
+        for ch in basename.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                sanitized.push(ch);
+            } else {
+                sanitized.push('_');
+            }
+        }
+
+        let sanitized = sanitized.trim_matches('.').trim_matches('_');
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized.to_string())
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn persist_inbound_attachment(
+        workspace: Option<&Path>,
+        file_name: &str,
+        data: &[u8],
+    ) -> Option<PathBuf> {
+        let workspace = workspace?;
+        if data.is_empty() {
+            return None;
+        }
+
+        match Self::write_inbound_attachment(workspace, file_name, data).await {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!(
+                    "WhatsApp Web: failed to persist inbound attachment {}: {}",
+                    file_name,
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn write_inbound_attachment(
+        workspace: &Path,
+        file_name: &str,
+        data: &[u8],
+    ) -> Result<PathBuf> {
+        use tokio::io::AsyncWriteExt;
+
+        let safe_name = Self::sanitize_attachment_filename(file_name)
+            .unwrap_or_else(|| "attachment".to_string());
+
+        tokio::fs::create_dir_all(workspace).await?;
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.to_path_buf());
+
+        let save_dir = workspace.join(WHATSAPP_ATTACHMENT_SAVE_SUBDIR);
+        tokio::fs::create_dir_all(&save_dir).await?;
+        let resolved_save_dir = tokio::fs::canonicalize(&save_dir).await?;
+        if !resolved_save_dir.starts_with(&workspace_root) {
+            anyhow::bail!(
+                "WhatsApp attachment save directory escapes workspace: {}",
+                resolved_save_dir.display()
+            );
+        }
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let unique = &unique[..8];
+        let output_path = resolved_save_dir.join(format!(
+            "wa_{}_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            unique,
+            safe_name
+        ));
+        let Some(parent_dir) = output_path.parent() else {
+            anyhow::bail!(
+                "WhatsApp attachment path has no parent: {}",
+                output_path.display()
+            );
+        };
+        let file_tail = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        let temp_path = parent_dir.join(format!(".{file_tail}.part"));
+
+        let mut temp_file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await?;
+        temp_file.write_all(data).await?;
+        temp_file.sync_all().await?;
+        drop(temp_file);
+
+        tokio::fs::rename(&temp_path, &output_path).await?;
+        Ok(output_path)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension(mime: &str, fallback: &str) -> String {
+        mime.split_once('/')
+            .map(|(_, ext)| ext.split(';').next().unwrap_or(ext))
+            .filter(|ext| !ext.trim().is_empty())
+            .unwrap_or(fallback)
+            .replace("jpeg", "jpg")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn push_downloaded_attachment(
+        client: &wa_rs::Client,
+        downloadable: &dyn wa_rs::download::Downloadable,
+        file_name: String,
+        mime: String,
+        workspace: Option<&Path>,
+        inbound_attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
+    ) {
+        match client.download(downloadable).await {
+            Ok(data) => {
+                let attachment_name =
+                    Self::persist_inbound_attachment(workspace, &file_name, &data)
+                        .await
+                        .map(|path| path.display().to_string())
+                        .unwrap_or(file_name);
+
+                inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
+                    file_name: attachment_name,
+                    data,
+                    mime_type: Some(mime),
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "WhatsApp Web: failed to download media attachment {}: {}",
+                    file_name,
+                    err
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn collect_media_attachments(
+        client: &wa_rs::Client,
+        msg: &wa_rs_proto::whatsapp::Message,
+        workspace: Option<&Path>,
+        file_prefix: &str,
+        inbound_attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
+    ) {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref img) = base.image_message {
+            let mime = img
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            let ext = Self::mime_extension(&mime, "jpg");
+            Self::push_downloaded_attachment(
+                client,
+                img.as_ref() as &dyn wa_rs::download::Downloadable,
+                format!("{file_prefix}image.{ext}"),
+                mime,
+                workspace,
+                inbound_attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref vid) = base.video_message {
+            let mime = vid
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string());
+            let ext = Self::mime_extension(&mime, "mp4");
+            Self::push_downloaded_attachment(
+                client,
+                vid.as_ref() as &dyn wa_rs::download::Downloadable,
+                format!("{file_prefix}video.{ext}"),
+                mime,
+                workspace,
+                inbound_attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref doc) = base.document_message {
+            let mime = doc
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let file_name = doc
+                .file_name
+                .clone()
+                .or_else(|| doc.title.clone())
+                .unwrap_or_else(|| "document".to_string());
+            Self::push_downloaded_attachment(
+                client,
+                doc.as_ref() as &dyn wa_rs::download::Downloadable,
+                format!("{file_prefix}{file_name}"),
+                mime,
+                workspace,
+                inbound_attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref stk) = base.sticker_message {
+            let mime = stk
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/webp".to_string());
+            let ext = Self::mime_extension(&mime, "webp");
+            Self::push_downloaded_attachment(
+                client,
+                stk.as_ref() as &dyn wa_rs::download::Downloadable,
+                format!("{file_prefix}sticker.{ext}"),
+                mime,
+                workspace,
+                inbound_attachments,
+            )
+            .await;
+        }
+    }
+
     /// Upload a local file and send it as a native WhatsApp media message.
     #[cfg(feature = "whatsapp-web")]
     #[allow(dead_code)] // WIP: not yet wired into send path
@@ -1412,6 +1693,7 @@ impl Channel for WhatsAppWebChannel {
             }
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
+            let workspace_dir = self.workspace_dir.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -1439,6 +1721,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
+                    let workspace_dir = workspace_dir.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -1639,63 +1922,30 @@ impl Channel for WhatsAppWebChannel {
                                 };
 
                                 // ── Inbound media attachment download ──
-                                // Download image / video / document payloads so the
-                                // media pipeline can describe them to the agent.
+                                // Download image / video / document / sticker payloads so the
+                                // media pipeline can describe them to the agent. When the
+                                // incoming message replies to media, also inspect the quoted
+                                // message's payload because WhatsApp stores that file under
+                                // `context_info.quoted_message`, not on the current text message.
                                 // Audio is already handled above via voice transcription.
-                                use wa_rs::download::Downloadable;
                                 let mut inbound_attachments: Vec<zeroclaw_api::media::MediaAttachment> = Vec::new();
-
-                                if let Some(ref img) = msg.image_message {
-                                    match client.download(img.as_ref() as &dyn Downloadable).await {
-                                        Ok(data) => {
-                                            let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
-                                            let ext = mime.split('/').nth(1).unwrap_or("jpg");
-                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
-                                                file_name: format!("image.{ext}"),
-                                                data,
-                                                mime_type: Some(mime),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("WhatsApp Web: failed to download image: {}", e);
-                                        }
-                                    }
-                                }
-
-                                if let Some(ref vid) = msg.video_message {
-                                    match client.download(vid.as_ref() as &dyn Downloadable).await {
-                                        Ok(data) => {
-                                            let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
-                                            let ext = mime.split('/').nth(1).unwrap_or("mp4");
-                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
-                                                file_name: format!("video.{ext}"),
-                                                data,
-                                                mime_type: Some(mime),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("WhatsApp Web: failed to download video: {}", e);
-                                        }
-                                    }
-                                }
-
-                                if let Some(ref doc) = msg.document_message {
-                                    match client.download(doc.as_ref() as &dyn Downloadable).await {
-                                        Ok(data) => {
-                                            let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
-                                            let file_name = doc.file_name.clone()
-                                                .or_else(|| doc.title.clone())
-                                                .unwrap_or_else(|| "document".to_string());
-                                            inbound_attachments.push(zeroclaw_api::media::MediaAttachment {
-                                                file_name,
-                                                data,
-                                                mime_type: Some(mime),
-                                            });
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("WhatsApp Web: failed to download document: {}", e);
-                                        }
-                                    }
+                                Self::collect_media_attachments(
+                                    client.as_ref(),
+                                    &msg,
+                                    workspace_dir.as_deref(),
+                                    "",
+                                    &mut inbound_attachments,
+                                )
+                                .await;
+                                if let Some(quoted) = Self::extract_quoted_message(&msg) {
+                                    Self::collect_media_attachments(
+                                        client.as_ref(),
+                                        quoted,
+                                        workspace_dir.as_deref(),
+                                        "quoted-",
+                                        &mut inbound_attachments,
+                                    )
+                                    .await;
                                 }
 
                                 // Build final content: if no text but we have media, use a
@@ -2283,6 +2533,50 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn with_workspace_dir_sets_field() {
+        let ch = make_channel().with_workspace_dir(PathBuf::from("/tmp/wa-workspace"));
+        assert_eq!(
+            ch.workspace_dir.as_deref(),
+            Some(Path::new("/tmp/wa-workspace"))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn sanitize_attachment_filename_strips_path_and_unsafe_chars() {
+        assert_eq!(
+            WhatsAppWebChannel::sanitize_attachment_filename("../my file!.zip"),
+            Some("my_file_.zip".to_string())
+        );
+        assert_eq!(WhatsAppWebChannel::sanitize_attachment_filename(".."), None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn write_inbound_attachment_persists_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let path = WhatsAppWebChannel::write_inbound_attachment(
+            workspace.path(),
+            "../my file!.zip",
+            b"zip",
+        )
+        .await
+        .expect("persist attachment");
+
+        let workspace_root = tokio::fs::canonicalize(workspace.path()).await.unwrap();
+        assert!(path.starts_with(workspace_root.join("whatsapp_files")));
+        assert!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("my_file_.zip")),
+            "unexpected saved filename: {}",
+            path.display()
+        );
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"zip");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn should_mark_inbound_as_read_only_for_accepted_inbound_messages() {
         assert!(WhatsAppWebChannel::should_mark_inbound_as_read(
             true,
@@ -2719,6 +3013,36 @@ mod tests {
             "6287778315246",
             Some("227728477442093")
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message_reads_extended_text_context() {
+        let quoted = wa_rs_proto::whatsapp::Message {
+            document_message: Some(Box::new(wa_rs_proto::whatsapp::message::DocumentMessage {
+                file_name: Some("SUPERAGENT-v3.1-OPENCLAW.zip".to_string()),
+                mimetype: Some("application/zip".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let msg = wa_rs_proto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("@Doloris coba ini".to_string()),
+                    context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                        quoted_message: Some(Box::new(quoted)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
+            .expect("quoted message should be extracted");
+        assert!(quoted.document_message.is_some());
     }
 
     #[test]

@@ -4569,18 +4569,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                         "WhatsApp channel send requires Web mode (session_path must be set)"
                     );
                 }
-                Ok(Arc::new(WhatsAppWebChannel::new(
-                    wa.session_path.clone().unwrap_or_default(),
-                    wa.pair_phone.clone(),
-                    wa.pair_code.clone(),
-                    wa.allowed_numbers.clone(),
-                    wa.mention_only,
-                    wa.mode.clone(),
-                    wa.dm_policy.clone(),
-                    wa.group_policy.clone(),
-                    wa.self_chat_mode,
-                    wa.send_read_receipts.unwrap_or(true),
-                )))
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(
+                        wa.session_path.clone().unwrap_or_default(),
+                        wa.pair_phone.clone(),
+                        wa.pair_code.clone(),
+                        wa.allowed_numbers.clone(),
+                        wa.mention_only,
+                        wa.mode.clone(),
+                        wa.dm_policy.clone(),
+                        wa.group_policy.clone(),
+                        wa.self_chat_mode,
+                        wa.send_read_receipts.unwrap_or(true),
+                    )
+                    .with_workspace_dir(config.workspace_dir.clone()),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -5157,7 +5160,8 @@ fn collect_configured_channels(
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(config.tts.clone())
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_workspace_dir(config.workspace_dir.clone()),
                             ),
                         });
                     } else {

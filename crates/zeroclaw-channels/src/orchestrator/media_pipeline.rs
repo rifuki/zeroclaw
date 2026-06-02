@@ -67,6 +67,10 @@ impl<'a> MediaPipeline<'a> {
                     let annotation = self.process_video(attachment);
                     annotations.push(annotation);
                 }
+                MediaKind::Unknown => {
+                    let annotation = self.process_file(attachment);
+                    annotations.push(annotation);
+                }
                 _ => {}
             }
         }
@@ -149,6 +153,33 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+
+    /// Describe a non-audio/image/video file attachment.
+    fn process_file(&self, attachment: &MediaAttachment) -> String {
+        let mime = attachment
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let path = std::path::Path::new(&attachment.file_name);
+
+        if path.is_absolute() {
+            let display_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&attachment.file_name);
+            format!(
+                "[File: {display_name} attached, saved at {}, {} bytes, MIME: {mime}]",
+                path.display(),
+                attachment.data.len()
+            )
+        } else {
+            format!(
+                "[File: {} attached, {} bytes, MIME: {mime}]",
+                attachment.file_name,
+                attachment.data.len()
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +216,14 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: vec![0u8; 200],
             mime_type: Some("video/mp4".to_string()),
+        }
+    }
+
+    fn sample_file() -> MediaAttachment {
+        MediaAttachment {
+            file_name: "/tmp/workspace/whatsapp_files/archive.zip".to_string(),
+            data: vec![0u8; 123],
+            mime_type: Some("application/zip".to_string()),
         }
     }
 
@@ -301,6 +340,20 @@ mod tests {
             result.contains("[Video: clip.mp4 attached]"),
             "expected video annotation, got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn file_annotation_includes_saved_path_and_size() {
+        let config = default_pipeline_config(true);
+        let tc = TranscriptionConfig::default();
+        let pipeline = MediaPipeline::new(&config, &tc, false);
+
+        let result = pipeline.process("install this", &[sample_file()]).await;
+        assert!(
+            result.contains("[File: archive.zip attached, saved at /tmp/workspace/whatsapp_files/archive.zip, 123 bytes, MIME: application/zip]"),
+            "expected saved file annotation, got: {result}"
+        );
+        assert!(result.contains("install this"));
     }
 
     #[tokio::test]
