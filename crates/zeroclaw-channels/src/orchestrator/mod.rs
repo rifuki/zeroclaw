@@ -13422,6 +13422,107 @@ This is an example JSON object for profile settings."#;
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
 
+    #[test]
+    fn conversation_history_key_shares_whatsapp_group_across_senders() {
+        let alice_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let bob_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "2".into(),
+            sender: "+22222222222".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "follow-up".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            conversation_history_key(&alice_msg),
+            conversation_history_key(&bob_msg)
+        );
+        assert_eq!(
+            conversation_history_key(&alice_msg),
+            "whatsapp_120363111111111111@g.us"
+        );
+    }
+
+    #[test]
+    fn conversation_history_key_isolates_whatsapp_groups() {
+        let group_a_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let group_b_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "2".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363222222222222@g.us".into(),
+            content: "same sender, different group".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_ne!(
+            conversation_history_key(&group_a_msg),
+            conversation_history_key(&group_b_msg)
+        );
+    }
+
+    #[test]
+    fn interruption_scope_key_shares_whatsapp_group_across_senders() {
+        let alice_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: Some("shared-turn".into()),
+            attachments: vec![],
+        };
+        let bob_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "2".into(),
+            sender: "+22222222222".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "follow-up".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: Some("shared-turn".into()),
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            interruption_scope_key(&alice_msg),
+            interruption_scope_key(&bob_msg)
+        );
+        assert_eq!(
+            interruption_scope_key(&alice_msg),
+            "whatsapp_120363111111111111@g.us_shared-turn"
+        );
+    }
+
     #[tokio::test]
     async fn message_dispatch_different_threads_do_not_cancel_each_other() {
         let channel_impl = Arc::new(SlackRecordingChannel::default());
