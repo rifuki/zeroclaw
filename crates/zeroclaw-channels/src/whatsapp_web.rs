@@ -1690,33 +1690,58 @@ impl Channel for WhatsAppWebChannel {
                                     content
                                 );
 
+                                let read_receipt_sender = is_group.then_some(&sender_jid);
+
                                 if content.is_empty() {
                                     tracing::debug!(
                                         "WhatsApp Web: ignoring empty or non-text message from {}",
                                         normalized
                                     );
+                                    Self::maybe_mark_inbound_as_read(
+                                        client.as_ref(),
+                                        &info.source.chat,
+                                        read_receipt_sender,
+                                        wa_send_read_receipts,
+                                        info.source.is_from_me,
+                                        is_self_chat,
+                                        &info.id,
+                                    )
+                                    .await;
                                     return;
                                 }
 
                                 // mention_only: skip group messages without a bot mention
                                 let content = if mention_only && is_group {
-                                    let bot_phone = bot_phone_inner.lock();
-                                    let bot_lid = bot_lid_inner.lock();
-                                    if bot_phone.is_some() || bot_lid.is_some() {
+                                    let (bot_phone_value, bot_lid_value) = {
+                                        let bot_phone = bot_phone_inner.lock();
+                                        let bot_lid = bot_lid_inner.lock();
+                                        (bot_phone.clone(), bot_lid.clone())
+                                    };
+                                    if bot_phone_value.is_some() || bot_lid_value.is_some() {
                                         let mentioned_jids =
                                             Self::extract_mentioned_jids(&msg);
-                                        let bp = bot_phone.as_deref().unwrap_or("");
-                                        let bl = bot_lid.as_deref();
+                                        let bp = bot_phone_value.as_deref().unwrap_or("");
+                                        let bl = bot_lid_value.as_deref();
                                         let is_mentioned = Self::contains_bot_mention(
                                             &content,
                                             &mentioned_jids,
                                             bp,
                                             bl,
-                                        ) || Self::is_reply_to_bot(&msg, bot_phone.as_deref(), bl);
+                                        ) || Self::is_reply_to_bot(&msg, bot_phone_value.as_deref(), bl);
                                         if !is_mentioned {
                                             tracing::debug!(
                                                 "WhatsApp Web: ignoring group message without bot mention"
                                             );
+                                            Self::maybe_mark_inbound_as_read(
+                                                client.as_ref(),
+                                                &info.source.chat,
+                                                read_receipt_sender,
+                                                wa_send_read_receipts,
+                                                info.source.is_from_me,
+                                                is_self_chat,
+                                                &info.id,
+                                            )
+                                            .await;
                                             return;
                                         }
                                         match Self::normalize_incoming_content(
@@ -1727,6 +1752,16 @@ impl Channel for WhatsAppWebChannel {
                                                 tracing::debug!(
                                                     "WhatsApp Web: message empty after stripping mention"
                                                 );
+                                                Self::maybe_mark_inbound_as_read(
+                                                    client.as_ref(),
+                                                    &info.source.chat,
+                                                    read_receipt_sender,
+                                                    wa_send_read_receipts,
+                                                    info.source.is_from_me,
+                                                    is_self_chat,
+                                                    &info.id,
+                                                )
+                                                .await;
                                                 return;
                                             }
                                         }
@@ -1734,6 +1769,16 @@ impl Channel for WhatsAppWebChannel {
                                         tracing::debug!(
                                             "WhatsApp Web: mention_only active but bot identity unknown, skipping group msg"
                                         );
+                                        Self::maybe_mark_inbound_as_read(
+                                            client.as_ref(),
+                                            &info.source.chat,
+                                            read_receipt_sender,
+                                            wa_send_read_receipts,
+                                            info.source.is_from_me,
+                                            is_self_chat,
+                                            &info.id,
+                                        )
+                                        .await;
                                         return;
                                     }
                                 } else {
@@ -1756,27 +1801,30 @@ impl Channel for WhatsAppWebChannel {
                                         Some(c) => c,
                                         None => {
                                             let was_structurally_mentioned = if is_group {
-                                                let bot_phone = bot_phone_inner.lock();
-                                                let bot_lid = bot_lid_inner.lock();
-                                                if bot_phone.is_none() && bot_lid.is_none() {
+                                                let (bot_phone_value, bot_lid_value) = {
+                                                    let bot_phone = bot_phone_inner.lock();
+                                                    let bot_lid = bot_lid_inner.lock();
+                                                    (bot_phone.clone(), bot_lid.clone())
+                                                };
+                                                if bot_phone_value.is_none() && bot_lid_value.is_none() {
                                                     // bot identity not yet known; allow media messages
                                                     // through so the user gets a response even if we
                                                     // can't verify the structured JID mention.
                                                     !inbound_attachments.is_empty()
                                                 } else {
                                                     let mentioned_jids = Self::extract_mentioned_jids(&msg);
-                                                    let is_reply = Self::is_reply_to_bot(&msg, bot_phone.as_deref(), bot_lid.as_deref());
+                                                    let is_reply = Self::is_reply_to_bot(&msg, bot_phone_value.as_deref(), bot_lid_value.as_deref());
                                                     is_reply || mentioned_jids.iter().any(|jid| {
                                                         let digits = Self::jid_digits(jid);
                                                         if digits.is_empty() {
                                                              return false;
                                                         }
-                                                        if let Some(ref bp) = *bot_phone
+                                                        if let Some(ref bp) = bot_phone_value
                                                             && digits == *bp
                                                         {
                                                             return true;
                                                         }
-                                                        if let Some(ref bl) = *bot_lid
+                                                        if let Some(ref bl) = bot_lid_value
                                                             && digits == *bl
                                                         {
                                                             return true;
@@ -1794,6 +1842,16 @@ impl Channel for WhatsAppWebChannel {
                                                 tracing::debug!(
                                                     "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
                                                 );
+                                                Self::maybe_mark_inbound_as_read(
+                                                    client.as_ref(),
+                                                    &info.source.chat,
+                                                    read_receipt_sender,
+                                                    wa_send_read_receipts,
+                                                    info.source.is_from_me,
+                                                    is_self_chat,
+                                                    &info.id,
+                                                )
+                                                .await;
                                                 return;
                                             }
                                         }
@@ -1819,7 +1877,6 @@ impl Channel for WhatsAppWebChannel {
                                 if let Err(e) = send_result {
                                     tracing::error!("Failed to send message to channel: {}", e);
                                 } else {
-                                    let read_receipt_sender = is_group.then_some(&sender_jid);
                                     Self::maybe_mark_inbound_as_read(
                                         client.as_ref(),
                                         &info.source.chat,
