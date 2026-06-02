@@ -4565,6 +4565,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     wa.dm_policy.clone(),
                     wa.group_policy.clone(),
                     wa.self_chat_mode,
+                    wa.send_read_receipts.unwrap_or(true),
                 )))
             }
             #[cfg(not(feature = "whatsapp-web"))]
@@ -5137,6 +5138,7 @@ fn collect_configured_channels(
                                     wa.dm_policy.clone(),
                                     wa.group_policy.clone(),
                                     wa.self_chat_mode,
+                                    wa.send_read_receipts.unwrap_or(true),
                                 )
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(config.tts.clone())

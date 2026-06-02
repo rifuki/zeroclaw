@@ -74,6 +74,8 @@ pub struct WhatsAppWebChannel {
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
+    /// Whether to mark accepted inbound messages as read on WhatsApp.
+    send_read_receipts: bool,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -125,6 +127,7 @@ impl WhatsAppWebChannel {
         dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         self_chat_mode: bool,
+        send_read_receipts: bool,
     ) -> Self {
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -152,6 +155,7 @@ impl WhatsAppWebChannel {
             dm_policy,
             group_policy,
             self_chat_mode,
+            send_read_receipts,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -559,6 +563,45 @@ impl WhatsAppWebChannel {
         Ok(())
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn should_mark_inbound_as_read(
+        send_read_receipts: bool,
+        is_from_me: bool,
+        is_self_chat: bool,
+        message_id: &str,
+    ) -> bool {
+        send_read_receipts && !is_from_me && !is_self_chat && !message_id.is_empty()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn maybe_mark_inbound_as_read(
+        client: &wa_rs::Client,
+        chat: &wa_rs_binary::jid::Jid,
+        sender: Option<&wa_rs_binary::jid::Jid>,
+        send_read_receipts: bool,
+        is_from_me: bool,
+        is_self_chat: bool,
+        message_id: &str,
+    ) {
+        if !Self::should_mark_inbound_as_read(
+            send_read_receipts,
+            is_from_me,
+            is_self_chat,
+            message_id,
+        ) {
+            return;
+        }
+
+        if let Err(e) = client
+            .mark_as_read(chat, sender, vec![message_id.to_string()])
+            .await
+        {
+            tracing::warn!("WhatsApp Web: failed to mark message as read: {e}");
+        } else {
+            tracing::debug!("WhatsApp Web: marked accepted inbound message as read");
+        }
+    }
+
     // ── Mention detection helpers (used when mention_only is enabled) ──
 
     /// Extract digits from a JID string (e.g. "919211916069@s.whatsapp.net" -> "919211916069").
@@ -671,15 +714,15 @@ impl WhatsAppWebChannel {
         if let Some(participant) = Self::extract_quoted_participant(msg) {
             let digits = Self::jid_digits(&participant);
             if !digits.is_empty() {
-                if let Some(bp) = bot_phone {
-                    if digits == bp {
-                        return true;
-                    }
+                if let Some(bp) = bot_phone
+                    && digits == bp
+                {
+                    return true;
                 }
-                if let Some(bl) = bot_lid {
-                    if digits == bl {
-                        return true;
-                    }
+                if let Some(bl) = bot_lid
+                    && digits == bl
+                {
+                    return true;
                 }
             }
         }
@@ -688,7 +731,12 @@ impl WhatsAppWebChannel {
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
     #[cfg(feature = "whatsapp-web")]
-    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str, bot_lid: Option<&str>) -> bool {
+    fn contains_bot_mention(
+        text: &str,
+        mentioned_jids: &[String],
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
         // 1. Structured: check if any mentioned_jid's digits match the bot's phone or LID digits
         for jid in mentioned_jids {
             let digits = Self::jid_digits(jid);
@@ -696,10 +744,10 @@ impl WhatsAppWebChannel {
                 if digits == bot_phone {
                     return true;
                 }
-                if let Some(bl) = bot_lid {
-                    if digits == bl {
-                        return true;
-                    }
+                if let Some(bl) = bot_lid
+                    && digits == bl
+                {
+                    return true;
                 }
             }
         }
@@ -731,10 +779,10 @@ impl WhatsAppWebChannel {
             return true;
         }
 
-        if let Some(bl) = bot_lid {
-            if has_text_mention(text, &format!("@{bl}")) {
-                return true;
-            }
+        if let Some(bl) = bot_lid
+            && has_text_mention(text, &format!("@{bl}"))
+        {
+            return true;
         }
 
         false
@@ -743,7 +791,11 @@ impl WhatsAppWebChannel {
     /// Strip text-based @<bot_phone> mention from the message, collapse whitespace.
     /// Returns None if the result is empty after stripping.
     #[cfg(feature = "whatsapp-web")]
-    fn normalize_incoming_content(text: &str, bot_phone: &str, bot_lid: Option<&str>) -> Option<String> {
+    fn normalize_incoming_content(
+        text: &str,
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> Option<String> {
         let mut content = text.to_string();
 
         let strip_pattern = |s: &mut String, pattern: &str| {
@@ -779,10 +831,7 @@ impl WhatsAppWebChannel {
             strip_pattern(&mut content, &format!("@{bl}"));
         }
 
-        let cleaned: String = content
-            .split_whitespace()
-            .collect::<Vec<&str>>()
-            .join(" ");
+        let cleaned: String = content.split_whitespace().collect::<Vec<&str>>().join(" ");
 
         if cleaned.is_empty() {
             None
@@ -1254,7 +1303,8 @@ impl Channel for WhatsAppWebChannel {
                 if let Some(ref pn) = device.pn {
                     let phone = pn.user();
                     let phone_base = phone.split(':').next().unwrap_or(phone);
-                    let digits: String = phone_base.chars().filter(|c| c.is_ascii_digit()).collect();
+                    let digits: String =
+                        phone_base.chars().filter(|c| c.is_ascii_digit()).collect();
                     if !digits.is_empty() {
                         *self.bot_phone.lock() = Some(digits.clone());
                         tracing::info!(
@@ -1309,6 +1359,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_policy = self.dm_policy.clone();
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
+            let wa_send_read_receipts = self.send_read_receipts;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
@@ -1348,6 +1399,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let wa_send_read_receipts = wa_send_read_receipts;
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
@@ -1380,6 +1432,13 @@ impl Channel for WhatsAppWebChannel {
                                     .cloned();
 
                                 let is_group = info.source.is_group;
+                                let sender_user = sender_jid.user();
+                                let chat_user = chat
+                                    .split_once('@')
+                                    .map(|(u, _)| u)
+                                    .unwrap_or(&chat);
+                                let is_self_chat =
+                                    !is_group && sender_user == chat_user && info.source.is_from_me;
 
                                 // Phone-based reply target.
                                 // LID JIDs (e.g. 76188559093817@lid) are internal
@@ -1411,13 +1470,6 @@ impl Channel for WhatsAppWebChannel {
                                     // Self-chat: the chat JID user part matches
                                     // the sender's user part (message to "Notes
                                     // to Self").
-                                    let sender_user = sender_jid.user();
-                                    let chat_user = chat
-                                        .split_once('@')
-                                        .map(|(u, _)| u)
-                                        .unwrap_or(&chat);
-                                    let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
-
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
                                             tracing::debug!(
@@ -1719,15 +1771,15 @@ impl Channel for WhatsAppWebChannel {
                                                         if digits.is_empty() {
                                                              return false;
                                                         }
-                                                        if let Some(ref bp) = *bot_phone {
-                                                             if digits == *bp {
-                                                                 return true;
-                                                             }
+                                                        if let Some(ref bp) = *bot_phone
+                                                            && digits == *bp
+                                                        {
+                                                            return true;
                                                         }
-                                                        if let Some(ref bl) = *bot_lid {
-                                                             if digits == *bl {
-                                                                 return true;
-                                                             }
+                                                        if let Some(ref bl) = *bot_lid
+                                                            && digits == *bl
+                                                        {
+                                                            return true;
                                                         }
                                                         false
                                                     })
@@ -1747,7 +1799,7 @@ impl Channel for WhatsAppWebChannel {
                                         }
                                     };
 
-                                if let Err(e) = tx_inner
+                                let send_result = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         channel: "whatsapp".to_string(),
@@ -1762,9 +1814,22 @@ impl Channel for WhatsAppWebChannel {
                                         interruption_scope_id: None,
                                         attachments: inbound_attachments,
                                     })
-                                    .await
-                                {
+                                    .await;
+
+                                if let Err(e) = send_result {
                                     tracing::error!("Failed to send message to channel: {}", e);
+                                } else {
+                                    let read_receipt_sender = is_group.then_some(&sender_jid);
+                                    Self::maybe_mark_inbound_as_read(
+                                        client.as_ref(),
+                                        &info.source.chat,
+                                        read_receipt_sender,
+                                        wa_send_read_receipts,
+                                        info.source.is_from_me,
+                                        is_self_chat,
+                                        &info.id,
+                                    )
+                                    .await;
                                 }
                             }
                             Event::Connected(_) => {
@@ -2041,6 +2106,7 @@ impl WhatsAppWebChannel {
         _dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         _group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         _self_chat_mode: bool,
+        _send_read_receipts: bool,
     ) -> Self {
         Self { _private: () }
     }
@@ -2112,6 +2178,7 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
+            true,
         )
     }
 
@@ -2120,6 +2187,45 @@ mod tests {
     fn whatsapp_web_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "whatsapp");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_read_receipts_enabled_from_constructor() {
+        let ch = make_channel();
+        assert!(ch.send_read_receipts);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn should_mark_inbound_as_read_only_for_accepted_inbound_messages() {
+        assert!(WhatsAppWebChannel::should_mark_inbound_as_read(
+            true,
+            false,
+            false,
+            "message-id"
+        ));
+        assert!(!WhatsAppWebChannel::should_mark_inbound_as_read(
+            false,
+            false,
+            false,
+            "message-id"
+        ));
+        assert!(!WhatsAppWebChannel::should_mark_inbound_as_read(
+            true,
+            true,
+            false,
+            "message-id"
+        ));
+        assert!(!WhatsAppWebChannel::should_mark_inbound_as_read(
+            true,
+            false,
+            true,
+            "message-id"
+        ));
+        assert!(!WhatsAppWebChannel::should_mark_inbound_as_read(
+            true, false, false, ""
+        ));
     }
 
     #[test]
@@ -2143,6 +2249,7 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
+            true,
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
@@ -2161,6 +2268,7 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
+            true,
         );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
@@ -2567,7 +2675,11 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn normalize_incoming_content_preserves_prefix_match() {
         assert_eq!(
-            WhatsAppWebChannel::normalize_incoming_content("@155512345678 hello", "15551234567", None),
+            WhatsAppWebChannel::normalize_incoming_content(
+                "@155512345678 hello",
+                "15551234567",
+                None
+            ),
             Some("@155512345678 hello".to_string())
         );
     }
@@ -2598,6 +2710,7 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
+            true,
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
     }
@@ -2615,6 +2728,7 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
+            true,
         );
         assert_eq!(*ch.bot_phone.lock(), None);
     }

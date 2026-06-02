@@ -7740,6 +7740,13 @@ pub struct WhatsAppConfig {
     /// user's own self-chat (Notes to Self). Defaults to false.
     #[serde(default)]
     pub self_chat_mode: bool,
+    /// Send read receipts for accepted inbound WhatsApp Web messages.
+    ///
+    /// Defaults to true when unset so linked personal devices do not keep
+    /// showing unread-message notifications after ZeroClaw handles a turn.
+    /// Set to false to leave messages unread on the primary WhatsApp device.
+    #[serde(default)]
+    pub send_read_receipts: Option<bool>,
     /// Regex patterns for DM mention gating (case-insensitive).
     /// When non-empty, only direct messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
@@ -13953,6 +13960,7 @@ bot_token = "xoxb-tok"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            send_read_receipts: None,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
@@ -13983,6 +13991,7 @@ bot_token = "xoxb-tok"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            send_read_receipts: None,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
@@ -14002,6 +14011,15 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn whatsapp_config_send_read_receipts_is_optional_opt_out() {
+        let parsed: WhatsAppConfig = toml::from_str("send_read_receipts = false").unwrap();
+        assert_eq!(parsed.send_read_receipts, Some(false));
+
+        let parsed: WhatsAppConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.send_read_receipts, None);
+    }
+
+    #[test]
     async fn whatsapp_config_wildcard_allowed() {
         let wc = WhatsAppConfig {
             enabled: true,
@@ -14018,6 +14036,7 @@ bot_token = "xoxb-tok"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            send_read_receipts: None,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
@@ -14045,6 +14064,7 @@ bot_token = "xoxb-tok"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            send_read_receipts: None,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
@@ -14071,6 +14091,7 @@ bot_token = "xoxb-tok"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            send_read_receipts: None,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
@@ -14108,6 +14129,7 @@ bot_token = "xoxb-tok"
                 dm_policy: WhatsAppChatPolicy::default(),
                 group_policy: WhatsAppChatPolicy::default(),
                 self_chat_mode: false,
+                send_read_receipts: None,
                 dm_mention_patterns: vec![],
                 group_mention_patterns: vec![],
                 proxy_url: None,
