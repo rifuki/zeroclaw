@@ -2991,6 +2991,12 @@ impl Channel for TelegramChannel {
             Some((chat, thread)) => (chat, Some(thread)),
             None => (message.recipient.as_str(), None),
         };
+        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let voice_content = if text_without_markers.trim().is_empty() {
+            content.trim()
+        } else {
+            text_without_markers.trim()
+        };
 
         // Voice reply mode: send text normally AND queue a voice note of the
         // final answer. Voice-note sessions are transient; explicitly allowed
@@ -3005,20 +3011,25 @@ impl Channel for TelegramChannel {
         if (is_voice_chat || is_static_voice_recipient) && self.tts_config.is_some() {
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let min_chars = if is_static_voice_recipient && !is_voice_chat {
+                8
+            } else {
+                40
+            };
+            let is_substantive = voice_content.chars().count() > min_chars
+                && !voice_content.starts_with("http")
+                && !voice_content.starts_with('{')
+                && !voice_content.starts_with('[')
+                && !voice_content.starts_with("Error")
+                && !voice_content.contains("```")
+                && !voice_content.contains("tool_call")
+                && !voice_content.contains("wttr.in");
 
             if is_substantive {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
+                        (voice_content.to_string(), std::time::Instant::now()),
                     );
                 }
 
@@ -3036,8 +3047,8 @@ impl Channel for TelegramChannel {
                     Duration::from_secs(10)
                 };
                 tokio::spawn(async move {
-                    // Wait 10 seconds — long enough for the agent to finish its
-                    // full tool chain and send the final answer.
+                    // Session voice replies keep the debounce to coalesce tool-chain
+                    // responses; static chat voice replies can send immediately.
                     tokio::time::sleep(debounce).await;
 
                     // Atomic check-and-remove: only one task gets the value
@@ -3077,8 +3088,6 @@ impl Channel for TelegramChannel {
         }
 
         // Always send text reply (voice chat gets both text and voice)
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
-
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
                 self.send_text_chunks(&text_without_markers, chat_id, thread_id)
