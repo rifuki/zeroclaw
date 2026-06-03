@@ -972,6 +972,18 @@ impl TelegramChannel {
         identities.into_iter().any(|id| self.is_user_allowed(id))
     }
 
+    fn is_static_voice_recipient(&self, recipient: &str) -> bool {
+        let chat_id = recipient
+            .split_once(':')
+            .map(|(chat, _)| chat)
+            .unwrap_or(recipient);
+
+        self.allowed_users
+            .read()
+            .map(|users| users.iter().any(|u| u == recipient || u == chat_id))
+            .unwrap_or(false)
+    }
+
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
         let Some(message) = update.get("message") else {
             return;
@@ -2980,15 +2992,17 @@ impl Channel for TelegramChannel {
             None => (message.recipient.as_str(), None),
         };
 
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Text in → text out. Voice in → text + voice out.
+        // Voice reply mode: send text normally AND queue a voice note of the
+        // final answer. Voice-note sessions are transient; explicitly allowed
+        // private Telegram chat IDs are static voice targets for this deploy.
         let is_voice_chat = self
             .voice_chats
             .lock()
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
+        let is_static_voice_recipient = self.is_static_voice_recipient(&message.recipient);
 
-        if is_voice_chat && self.tts_config.is_some() {
+        if (is_voice_chat || is_static_voice_recipient) && self.tts_config.is_some() {
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
             let is_substantive = content.len() > 40
@@ -3016,15 +3030,20 @@ impl Channel for TelegramChannel {
                 let thread_id_owned = thread_id.map(str::to_string);
                 let recipient = message.recipient.clone();
                 let tts_config = self.tts_config.clone().unwrap();
+                let debounce = if is_static_voice_recipient && !is_voice_chat {
+                    Duration::from_secs(0)
+                } else {
+                    Duration::from_secs(10)
+                };
                 tokio::spawn(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    tokio::time::sleep(debounce).await;
 
                     // Atomic check-and-remove: only one task gets the value
                     let to_voice = pending.lock().ok().and_then(|mut pv| {
                         if let Some((_, ts)) = pv.get(&recipient)
-                            && ts.elapsed().as_secs() >= 8
+                            && (debounce.is_zero() || ts.elapsed().as_secs() >= 8)
                         {
                             return pv.remove(&recipient).map(|(text, _)| text);
                         }
@@ -3710,6 +3729,23 @@ mod tests {
     fn telegram_user_allowed_with_at_prefix_in_config() {
         let ch = TelegramChannel::new("t".into(), vec!["@alice".into()], false);
         assert!(ch.is_user_allowed("alice"));
+    }
+
+    #[test]
+    fn telegram_static_voice_recipient_matches_explicit_chat_id() {
+        let ch = TelegramChannel::new("t".into(), vec!["849612359".into()], false);
+
+        assert!(ch.is_static_voice_recipient("849612359"));
+        assert!(ch.is_static_voice_recipient("849612359:7"));
+        assert!(!ch.is_static_voice_recipient("-100123456789"));
+    }
+
+    #[test]
+    fn telegram_static_voice_recipient_does_not_match_wildcard() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+
+        assert!(!ch.is_static_voice_recipient("849612359"));
+        assert!(!ch.is_static_voice_recipient("-100123456789"));
     }
 
     #[test]
