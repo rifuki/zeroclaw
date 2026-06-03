@@ -14,7 +14,7 @@ use zeroclaw_config::schema::TtsConfig;
 const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 
 /// Default HTTP request timeout for TTS API calls.
-const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 // ── TtsProvider trait ────────────────────────────────────────────
 
