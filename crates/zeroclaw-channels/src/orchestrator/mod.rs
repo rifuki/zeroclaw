@@ -201,6 +201,10 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+pub(crate) const WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX: &str =
+    "[ZeroClaw internal: passive WhatsApp group context]\n";
+const WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER: &str =
+    "[No reply sent: passive WhatsApp group context]";
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -2280,6 +2284,55 @@ fn is_group_reply_target(reply_target: &str) -> bool {
     reply_target.contains("@g.us") || reply_target.starts_with("group:")
 }
 
+fn is_passive_whatsapp_group_context(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    msg.channel == "whatsapp"
+        && is_group_reply_target(&msg.reply_target)
+        && msg
+            .content
+            .starts_with(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
+}
+
+fn take_passive_whatsapp_group_context(msg: &mut zeroclaw_api::channel::ChannelMessage) -> bool {
+    if !is_passive_whatsapp_group_context(msg) {
+        return false;
+    }
+
+    let Some(content) = msg
+        .content
+        .strip_prefix(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
+    else {
+        return false;
+    };
+
+    msg.content = content.to_string();
+    true
+}
+
+fn store_passive_whatsapp_group_context(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let content = channel_history_content_for_user_turn(&msg.content);
+    if content.trim().is_empty() {
+        return false;
+    }
+
+    let attributed_content = if msg.sender.trim().is_empty() {
+        format!("[WhatsApp group message]\n{content}")
+    } else {
+        format!("[WhatsApp group message from {}]\n{content}", msg.sender)
+    };
+    let history_key = conversation_history_key(msg);
+
+    append_sender_turn(ctx, &history_key, ChatMessage::user(&attributed_content));
+    append_sender_turn(
+        ctx,
+        &history_key,
+        ChatMessage::assistant(WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER),
+    );
+    true
+}
+
 fn sender_memory_session_ids<'a>(
     msg: &'a zeroclaw_api::channel::ChannelMessage,
     history_key: &'a str,
@@ -2915,6 +2968,9 @@ async fn process_channel_message(
         return;
     }
 
+    let mut msg = msg;
+    let passive_whatsapp_group_context = take_passive_whatsapp_group_context(&mut msg);
+
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -2949,6 +3005,31 @@ async fn process_channel_message(
     } else {
         msg
     };
+
+    if passive_whatsapp_group_context {
+        if store_passive_whatsapp_group_context(ctx.as_ref(), &msg) {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Stored passive WhatsApp group context without starting an agent turn"
+            );
+            runtime_trace::record_event(
+                "channel_message_passive_context_stored",
+                Some(msg.channel.as_str()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "message_id": msg.id,
+                    "reply_target": msg.reply_target,
+                }),
+            );
+        }
+        return;
+    }
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
@@ -4244,6 +4325,15 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Passive WhatsApp group context is a cheap, deterministic history
+        // update. Process it serially so it cannot be debounced with a later
+        // mention, race that mention's history load, or replace an in-flight
+        // agent turn.
+        if is_passive_whatsapp_group_context(&msg) {
+            process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+            continue;
+        }
+
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
@@ -4672,6 +4762,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                         wa.self_chat_mode,
                         wa.send_read_receipts.unwrap_or(true),
                     )
+                    .with_passive_group_context(wa.passive_group_context)
                     .with_workspace_dir(config.workspace_dir.clone()),
                 ))
             }
@@ -5247,6 +5338,7 @@ fn collect_configured_channels(
                                     wa.self_chat_mode,
                                     wa.send_read_receipts.unwrap_or(true),
                                 )
+                                .with_passive_group_context(wa.passive_group_context)
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(config.tts.clone())
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
@@ -7689,6 +7781,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        system_calls: AtomicUsize,
         vision: bool,
     }
 
@@ -7701,6 +7794,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            self.system_calls.fetch_add(1, Ordering::SeqCst);
             Ok("fallback".to_string())
         }
 
@@ -11670,6 +11764,153 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_stores_passive_whatsapp_group_context_for_follow_up() {
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "passive-wa-group-1".to_string(),
+                sender: "+11111111111".to_string(),
+                reply_target: "120363111111111111@g.us".to_string(),
+                content: format!("{WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX}LEMON-842"),
+                channel: "whatsapp".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            calls.is_empty(),
+            "passive context must not call the provider"
+        );
+        drop(calls);
+        assert_eq!(
+            provider_impl.system_calls.load(Ordering::SeqCst),
+            0,
+            "passive context must not call the provider precheck"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek("whatsapp_120363111111111111@g.us")
+            .expect("passive group context should be stored");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.contains("+11111111111"));
+        assert!(turns[0].content.contains("LEMON-842"));
+        assert!(
+            !turns[0]
+                .content
+                .contains(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
+        );
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(
+            turns[1].content,
+            WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER
+        );
+        drop(histories);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "addressed-wa-group-2".to_string(),
+                sender: "+22222222222".to_string(),
+                reply_target: "120363111111111111@g.us".to_string(),
+                content: "what was the code?".to_string(),
+                channel: "whatsapp".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .iter()
+                .any(|(_, content)| content.contains("LEMON-842"))
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_enriches_current_turn_without_persisting_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -13708,6 +13949,45 @@ This is an example JSON object for profile settings."#;
         assert_ne!(
             conversation_history_key(&group_a_msg),
             conversation_history_key(&group_b_msg)
+        );
+    }
+
+    #[test]
+    fn take_passive_whatsapp_group_context_strips_internal_prefix() {
+        let mut msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: format!("{WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX}LEMON-842"),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert!(take_passive_whatsapp_group_context(&mut msg));
+        assert_eq!(msg.content, "LEMON-842");
+    }
+
+    #[test]
+    fn take_passive_whatsapp_group_context_ignores_direct_messages() {
+        let mut msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "11111111111@s.whatsapp.net".into(),
+            content: format!("{WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX}LEMON-842"),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert!(!take_passive_whatsapp_group_context(&mut msg));
+        assert!(
+            msg.content
+                .starts_with(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
         );
     }
 

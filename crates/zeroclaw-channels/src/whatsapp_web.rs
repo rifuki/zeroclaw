@@ -65,6 +65,8 @@ pub struct WhatsAppWebChannel {
     allowed_numbers: Vec<String>,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
+    /// Store unaddressed group messages as silent shared conversation context.
+    passive_group_context: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -154,6 +156,7 @@ impl WhatsAppWebChannel {
             pair_code,
             allowed_numbers,
             mention_only,
+            passive_group_context: false,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
             mode,
@@ -233,6 +236,22 @@ impl WhatsAppWebChannel {
             super::whatsapp::WhatsAppChannel::compile_mention_patterns(&patterns),
         );
         self
+    }
+
+    /// Store group messages rejected by mention gating as silent conversation context.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
+        self.passive_group_context = enabled;
+        self
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mark_passive_group_context(content: String) -> String {
+        format!(
+            "{}{}",
+            crate::orchestrator::WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX,
+            content
+        )
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -1593,6 +1612,15 @@ impl Channel for WhatsAppWebChannel {
 
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+        if self.passive_group_context
+            && !self.mention_only
+            && self.group_mention_patterns.is_empty()
+        {
+            tracing::warn!(
+                "WhatsApp Web: passive_group_context has no effect without mention_only or group_mention_patterns"
+            );
+        }
+
         loop {
             let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
 
@@ -1677,6 +1705,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_self_chat_mode = self.self_chat_mode;
             let wa_send_read_receipts = self.send_read_receipts;
             let mention_only = self.mention_only;
+            let wa_passive_group_context = self.passive_group_context;
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
             // Pre-populate bot identity from pair_phone config if present,
@@ -1717,6 +1746,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
                     let wa_send_read_receipts = wa_send_read_receipts;
+                    let wa_passive_group_context = wa_passive_group_context;
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
@@ -1988,6 +2018,8 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                let mut passive_context_only = false;
+
                                 // mention_only: skip group messages without a bot mention
                                 let content = if mention_only && is_group {
                                     let (bot_phone_value, bot_lid_value) = {
@@ -2007,28 +2039,12 @@ impl Channel for WhatsAppWebChannel {
                                             bl,
                                         ) || Self::is_reply_to_bot(&msg, bot_phone_value.as_deref(), bl);
                                         if !is_mentioned {
-                                            tracing::debug!(
-                                                "WhatsApp Web: ignoring group message without bot mention"
-                                            );
-                                            Self::maybe_mark_inbound_as_read(
-                                                client.as_ref(),
-                                                &info.source.chat,
-                                                read_receipt_sender,
-                                                wa_send_read_receipts,
-                                                info.source.is_from_me,
-                                                is_self_chat,
-                                                &info.id,
-                                            )
-                                            .await;
-                                            return;
-                                        }
-                                        match Self::normalize_incoming_content(
-                                            &content, bp, bl,
-                                        ) {
-                                            Some(c) => c,
-                                            None => {
+                                            if wa_passive_group_context {
+                                                passive_context_only = true;
+                                                content
+                                            } else {
                                                 tracing::debug!(
-                                                    "WhatsApp Web: message empty after stripping mention"
+                                                    "WhatsApp Web: ignoring group message without bot mention"
                                                 );
                                                 Self::maybe_mark_inbound_as_read(
                                                     client.as_ref(),
@@ -2041,6 +2057,28 @@ impl Channel for WhatsAppWebChannel {
                                                 )
                                                 .await;
                                                 return;
+                                            }
+                                        } else {
+                                            match Self::normalize_incoming_content(
+                                                &content, bp, bl,
+                                            ) {
+                                                Some(c) => c,
+                                                None => {
+                                                    tracing::debug!(
+                                                        "WhatsApp Web: message empty after stripping mention"
+                                                    );
+                                                    Self::maybe_mark_inbound_as_read(
+                                                        client.as_ref(),
+                                                        &info.source.chat,
+                                                        read_receipt_sender,
+                                                        wa_send_read_receipts,
+                                                        info.source.is_from_me,
+                                                        is_self_chat,
+                                                        &info.id,
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
                                             }
                                         }
                                     } else {
@@ -2069,7 +2107,9 @@ impl Channel for WhatsAppWebChannel {
                                 // When the applicable pattern set is non-empty,
                                 // messages without a match are dropped and
                                 // matched fragments are stripped.
-                                let content =
+                                let content = if passive_context_only {
+                                    content
+                                } else {
                                     match super::whatsapp::WhatsAppChannel::apply_mention_gating(
                                         &wa_dm_mention_patterns,
                                         &wa_group_mention_patterns,
@@ -2116,6 +2156,9 @@ impl Channel for WhatsAppWebChannel {
 
                                             if was_structurally_mentioned {
                                                 content
+                                            } else if wa_passive_group_context && is_group {
+                                                passive_context_only = true;
+                                                content
                                             } else {
                                                 tracing::debug!(
                                                     "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
@@ -2133,7 +2176,17 @@ impl Channel for WhatsAppWebChannel {
                                                 return;
                                             }
                                         }
-                                    };
+                                    }
+                                };
+
+                                let content = if passive_context_only {
+                                    tracing::debug!(
+                                        "WhatsApp Web: forwarding unaddressed group message as passive context"
+                                    );
+                                    Self::mark_passive_group_context(content)
+                                } else {
+                                    content
+                                };
 
                                 let send_result = tx_inner
                                     .send(ChannelMessage {
@@ -2453,6 +2506,10 @@ impl WhatsAppWebChannel {
     pub fn with_tts(self, _config: zeroclaw_config::schema::TtsConfig) -> Self {
         self
     }
+
+    pub fn with_passive_group_context(self, _enabled: bool) -> Self {
+        self
+    }
 }
 
 #[cfg(not(feature = "whatsapp-web"))]
@@ -2529,6 +2586,26 @@ mod tests {
     fn whatsapp_web_read_receipts_enabled_from_constructor() {
         let ch = make_channel();
         assert!(ch.send_read_receipts);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_passive_group_context_sets_field() {
+        let ch = make_channel().with_passive_group_context(true);
+        assert!(ch.passive_group_context);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mark_passive_group_context_prefixes_content() {
+        let content = WhatsAppWebChannel::mark_passive_group_context("background fact".into());
+        assert_eq!(
+            content,
+            format!(
+                "{}background fact",
+                crate::orchestrator::WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX
+            )
+        );
     }
 
     #[test]

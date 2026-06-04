@@ -7729,6 +7729,12 @@ pub struct WhatsAppConfig {
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, group messages rejected by mention gating are stored as
+    /// silent conversation context instead of being dropped (Web mode only).
+    /// Requires `mention_only = true` or non-empty `group_mention_patterns`.
+    /// Defaults to false.
+    #[serde(default)]
+    pub passive_group_context: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
@@ -13962,6 +13968,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
             mention_only: false,
+            passive_group_context: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -13993,6 +14000,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
             mention_only: false,
+            passive_group_context: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -14026,6 +14034,15 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn whatsapp_config_passive_group_context_defaults_off() {
+        let parsed: WhatsAppConfig = toml::from_str("").unwrap();
+        assert!(!parsed.passive_group_context);
+
+        let parsed: WhatsAppConfig = toml::from_str("passive_group_context = true").unwrap();
+        assert!(parsed.passive_group_context);
+    }
+
+    #[test]
     async fn whatsapp_config_wildcard_allowed() {
         let wc = WhatsAppConfig {
             enabled: true,
@@ -14038,6 +14055,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             allowed_numbers: vec!["*".into()],
             mention_only: false,
+            passive_group_context: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -14066,6 +14084,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
             mention_only: false,
+            passive_group_context: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -14093,6 +14112,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             allowed_numbers: vec![],
             mention_only: false,
+            passive_group_context: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -14131,6 +14151,7 @@ bot_token = "xoxb-tok"
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
                 mention_only: false,
+                passive_group_context: false,
                 mode: WhatsAppWebMode::default(),
                 dm_policy: WhatsAppChatPolicy::default(),
                 group_policy: WhatsAppChatPolicy::default(),
