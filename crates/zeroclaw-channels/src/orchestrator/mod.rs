@@ -726,10 +726,20 @@ fn build_channel_system_prompt(
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut normalized = Vec::with_capacity(turns.len());
+    // Filter out passive WhatsApp group context history markers from assistant turns before normalizing.
+    // We keep the user messages containing the passive context so the LLM retains access to them.
+    let mut filtered_turns = Vec::with_capacity(turns.len());
+    for turn in turns {
+        if turn.role == "assistant" && turn.content == WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER {
+            continue;
+        }
+        filtered_turns.push(turn);
+    }
+
+    let mut normalized = Vec::with_capacity(filtered_turns.len());
     let mut expecting_user = true;
 
-    for turn in turns {
+    for turn in filtered_turns {
         match (expecting_user, turn.role.as_str()) {
             // Pass through tool-role messages preserved by
             // keep_tool_context_turns (#4827).  After a tool result the
@@ -12787,6 +12797,23 @@ This is an example JSON object for profile settings."#;
         let result = normalize_cached_channel_turns(vec![]);
         assert!(result.is_empty());
     }
+
+    #[test]
+    fn normalize_cached_channel_turns_filters_passive_group_context() {
+        let turns = vec![
+            ChatMessage::user("[WhatsApp group message from rifuki]\nhello"),
+            ChatMessage::assistant(WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER),
+            ChatMessage::user("real user message"),
+        ];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(
+            result[0].content,
+            "[WhatsApp group message from rifuki]\nhello\n\nreal user message"
+        );
+    }
+
 
     // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
 
