@@ -1,0 +1,20 @@
+[Unit]
+Description=Private MikuTTS bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.zeroclaw-local/mikutts-bridge
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MIKUTTS_HF_BASE_URL=https://john6666-mikutts.hf.space
+Environment=MIKUTTS_MODEL=1a_miku_default_rvc_(aple)
+Environment=MIKUTTS_VOICE=id-ID-GadisNeural-Female
+Environment=MIKUTTS_F0_UP_KEY=6
+Environment=MIKUTTS_F0_METHOD=rmvpe
+Environment=MIKUTTS_EDGE_FALLBACK=false
+ExecStart=%h/.local/bin/uvicorn app:app --host 127.0.0.1 --port 55021
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

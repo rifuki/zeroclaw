@@ -3035,12 +3035,26 @@ async fn process_channel_message(
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision =
             ctx.provider.supports_vision() || dedicated_vision_provider_configured(&ctx.multimodal);
+        let mut vision_provider = None;
+        let mut vision_model = None;
+
+        if ctx.media_pipeline.describe_images && !ctx.provider.supports_vision() {
+            if let Some(ref vp) = ctx.multimodal.vision_provider {
+                if let Ok(prov) = get_or_create_provider(ctx.as_ref(), vp, None).await {
+                    vision_provider = Some(prov);
+                    vision_model = ctx.multimodal.vision_model.clone();
+                }
+            }
+        }
+
         let pipeline = media_pipeline::MediaPipeline::new(
             &ctx.media_pipeline,
             &ctx.transcription_config,
             vision,
+            vision_provider,
+            vision_model,
         );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+        msg.content = Box::pin(pipeline.process(&msg.content, &mut msg.attachments)).await;
     }
 
     // ── Link enricher: prepend URL summaries before agent sees the message ──
