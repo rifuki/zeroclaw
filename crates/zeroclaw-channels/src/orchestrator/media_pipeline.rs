@@ -15,7 +15,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
 use std::sync::Arc;
-use zeroclaw_api::provider::{Provider, ChatMessage, ChatRequest};
+use zeroclaw_api::provider::{ChatMessage, ChatRequest, Provider};
 use zeroclaw_config::schema::{MediaPipelineConfig, TranscriptionConfig};
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
@@ -55,7 +55,11 @@ impl<'a> MediaPipeline<'a> {
     /// Process a message's attachments and return enriched text.
     ///
     /// If the pipeline is disabled via config, returns `original_text` unchanged.
-    pub async fn process(&self, original_text: &str, attachments: &mut Vec<MediaAttachment>) -> String {
+    pub async fn process(
+        &self,
+        original_text: &str,
+        attachments: &mut Vec<MediaAttachment>,
+    ) -> String {
         if !self.config.enabled || attachments.is_empty() {
             return original_text.to_string();
         }
@@ -192,7 +196,10 @@ impl<'a> MediaPipeline<'a> {
                     let description = response.text_or_empty().trim();
                     if !description.is_empty() {
                         return (
-                            format!("[Image description ({}): {}]", attachment.file_name, description),
+                            format!(
+                                "[Image description ({}): {}]",
+                                attachment.file_name, description
+                            ),
                             true, // Transcribed: remove attachment
                         );
                     }
@@ -601,7 +608,9 @@ mod tests {
         );
 
         let mut attachments = vec![sample_image()];
-        let result = pipeline.process("identify this cat", &mut attachments).await;
+        let result = pipeline
+            .process("identify this cat", &mut attachments)
+            .await;
 
         assert!(
             result.contains("[Image description (photo.jpg): A cute orange cat sleeping on a computer keyboard.]"),

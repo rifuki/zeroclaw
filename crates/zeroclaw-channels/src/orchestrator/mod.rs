@@ -730,7 +730,8 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     // We keep the user messages containing the passive context so the LLM retains access to them.
     let mut filtered_turns = Vec::with_capacity(turns.len());
     for turn in turns {
-        if turn.role == "assistant" && turn.content == WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER {
+        if turn.role == "assistant" && turn.content == WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER
+        {
             continue;
         }
         filtered_turns.push(turn);
@@ -1722,6 +1723,30 @@ fn channel_history_content_for_user_turn(content: &str) -> String {
     }
 }
 
+fn attributed_whatsapp_group_user_turn(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    content: &str,
+) -> String {
+    if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
+        if msg.sender.trim().is_empty() {
+            format!("[WhatsApp group message]\n{content}")
+        } else {
+            format!("[WhatsApp group message from {}]\n{content}", msg.sender)
+        }
+    } else {
+        content.to_string()
+    }
+}
+
+fn channel_history_content_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    let content = channel_history_content_for_user_turn(&msg.content);
+    attributed_whatsapp_group_user_turn(msg, &content)
+}
+
+fn channel_full_content_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    attributed_whatsapp_group_user_turn(msg, &msg.content)
+}
+
 fn restore_current_user_turn_media_payload(
     turns: &mut [ChatMessage],
     history_content: &str,
@@ -2327,11 +2352,7 @@ fn store_passive_whatsapp_group_context(
         return false;
     }
 
-    let attributed_content = if msg.sender.trim().is_empty() {
-        format!("[WhatsApp group message]\n{content}")
-    } else {
-        format!("[WhatsApp group message from {}]\n{content}", msg.sender)
-    };
+    let attributed_content = attributed_whatsapp_group_user_turn(msg, &content);
     let history_key = conversation_history_key(msg);
 
     append_sender_turn(ctx, &history_key, ChatMessage::user(&attributed_content));
@@ -3048,13 +3069,13 @@ async fn process_channel_message(
         let mut vision_provider = None;
         let mut vision_model = None;
 
-        if ctx.media_pipeline.describe_images && !ctx.provider.supports_vision() {
-            if let Some(ref vp) = ctx.multimodal.vision_provider {
-                if let Ok(prov) = get_or_create_provider(ctx.as_ref(), vp, None).await {
-                    vision_provider = Some(prov);
-                    vision_model = ctx.multimodal.vision_model.clone();
-                }
-            }
+        if ctx.media_pipeline.describe_images
+            && !ctx.provider.supports_vision()
+            && let Some(ref vp) = ctx.multimodal.vision_provider
+            && let Ok(prov) = get_or_create_provider(ctx.as_ref(), vp, None).await
+        {
+            vision_provider = Some(prov);
+            vision_model = ctx.multimodal.vision_model.clone();
         }
 
         let pipeline = media_pipeline::MediaPipeline::new(
@@ -3178,18 +3199,20 @@ async fn process_channel_message(
             return;
         }
     };
-    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+    let memory_user_content = channel_history_content_for_user_turn(&msg.content);
+    let history_user_content = channel_history_content_for_message(&msg);
+    let history_full_user_content = channel_full_content_for_message(&msg);
 
     if ctx.auto_save_memory
-        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
+        && memory_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&memory_user_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &history_user_content,
+                &memory_user_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -3245,7 +3268,7 @@ async fn process_channel_message(
 
     // Build history from per-sender conversation cache.
     let mut prior_turns_raw = if force_fresh_session {
-        vec![ChatMessage::user(&msg.content)]
+        vec![ChatMessage::user(&history_full_user_content)]
     } else {
         ctx.conversation_histories
             .lock()
@@ -3258,7 +3281,7 @@ async fn process_channel_message(
         restore_current_user_turn_media_payload(
             &mut prior_turns_raw,
             &history_user_content,
-            &msg.content,
+            &history_full_user_content,
         );
     }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
@@ -11867,43 +11890,45 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            calls.is_empty(),
-            "passive context must not call the provider"
-        );
-        drop(calls);
+        {
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                calls.is_empty(),
+                "passive context must not call the provider"
+            );
+        }
         assert_eq!(
             provider_impl.system_calls.load(Ordering::SeqCst),
             0,
             "passive context must not call the provider precheck"
         );
 
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek("whatsapp_120363111111111111@g.us")
-            .expect("passive group context should be stored");
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].role, "user");
-        assert!(turns[0].content.contains("+11111111111"));
-        assert!(turns[0].content.contains("LEMON-842"));
-        assert!(
-            !turns[0]
-                .content
-                .contains(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
-        );
-        assert_eq!(turns[1].role, "assistant");
-        assert_eq!(
-            turns[1].content,
-            WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER
-        );
-        drop(histories);
+        {
+            let histories = runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .peek("whatsapp_120363111111111111@g.us")
+                .expect("passive group context should be stored");
+            assert_eq!(turns.len(), 2);
+            assert_eq!(turns[0].role, "user");
+            assert!(turns[0].content.contains("+11111111111"));
+            assert!(turns[0].content.contains("LEMON-842"));
+            assert!(
+                !turns[0]
+                    .content
+                    .contains(WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX)
+            );
+            assert_eq!(turns[1].role, "assistant");
+            assert_eq!(
+                turns[1].content,
+                WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER
+            );
+        }
 
         process_channel_message(
             runtime_ctx,
@@ -12813,7 +12838,6 @@ This is an example JSON object for profile settings."#;
             "[WhatsApp group message from rifuki]\nhello\n\nreal user message"
         );
     }
-
 
     // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
 
@@ -14078,6 +14102,45 @@ This is an example JSON object for profile settings."#;
             history_content,
             "[Image attachment processed by vision model]"
         );
+    }
+
+    #[test]
+    fn channel_history_content_for_message_attributes_whatsapp_group_sender() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "zeroclaw --version".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            channel_history_content_for_message(&msg),
+            "[WhatsApp group message from +11111111111]\nzeroclaw --version"
+        );
+    }
+
+    #[test]
+    fn channel_full_content_for_message_attributes_whatsapp_group_media_payload() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "+11111111111".into(),
+            reply_target: "120363111111111111@g.us".into(),
+            content: "[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?".into(),
+            channel: "whatsapp".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let full_content = channel_full_content_for_message(&msg);
+
+        assert!(full_content.starts_with("[WhatsApp group message from +11111111111]"));
+        assert!(full_content.contains("[IMAGE:data:image/png;base64,abcd]"));
     }
 
     #[test]
