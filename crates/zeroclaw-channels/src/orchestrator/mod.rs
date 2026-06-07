@@ -205,6 +205,8 @@ pub(crate) const WHATSAPP_PASSIVE_GROUP_CONTEXT_PREFIX: &str =
     "[ZeroClaw internal: passive WhatsApp group context]\n";
 const WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER: &str =
     "[No reply sent: passive WhatsApp group context]";
+const WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL: &str = "Observed WhatsApp group message";
+const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group message";
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -1723,16 +1725,22 @@ fn channel_history_content_for_user_turn(content: &str) -> String {
     }
 }
 
+fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        format!("[{label}]\n{content}")
+    } else {
+        format!("[{label} from {sender}]\n{content}")
+    }
+}
+
 fn attributed_whatsapp_group_user_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
+    label: &str,
     content: &str,
 ) -> String {
     if msg.channel == "whatsapp" && is_group_reply_target(&msg.reply_target) {
-        if msg.sender.trim().is_empty() {
-            format!("[WhatsApp group message]\n{content}")
-        } else {
-            format!("[WhatsApp group message from {}]\n{content}", msg.sender)
-        }
+        format_whatsapp_group_history_turn(label, &msg.sender, content)
     } else {
         content.to_string()
     }
@@ -1740,11 +1748,11 @@ fn attributed_whatsapp_group_user_turn(
 
 fn channel_history_content_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     let content = channel_history_content_for_user_turn(&msg.content);
-    attributed_whatsapp_group_user_turn(msg, &content)
+    attributed_whatsapp_group_user_turn(msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL, &content)
 }
 
 fn channel_full_content_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    attributed_whatsapp_group_user_turn(msg, &msg.content)
+    attributed_whatsapp_group_user_turn(msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL, &msg.content)
 }
 
 fn restore_current_user_turn_media_payload(
@@ -2352,7 +2360,8 @@ fn store_passive_whatsapp_group_context(
         return false;
     }
 
-    let attributed_content = attributed_whatsapp_group_user_turn(msg, &content);
+    let attributed_content =
+        attributed_whatsapp_group_user_turn(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL, &content);
     let history_key = conversation_history_key(msg);
 
     append_sender_turn(ctx, &history_key, ChatMessage::user(&attributed_content));
@@ -11916,6 +11925,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 .expect("passive group context should be stored");
             assert_eq!(turns.len(), 2);
             assert_eq!(turns[0].role, "user");
+            assert!(
+                turns[0]
+                    .content
+                    .starts_with("[Observed WhatsApp group message from +11111111111]\n")
+            );
             assert!(turns[0].content.contains("+11111111111"));
             assert!(turns[0].content.contains("LEMON-842"));
             assert!(
@@ -11956,6 +11970,11 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0]
                 .iter()
                 .any(|(_, content)| content.contains("LEMON-842"))
+        );
+        assert!(
+            calls[0].iter().any(|(_, content)| content.contains(
+                "[Current WhatsApp group message from +22222222222]\nwhat was the code?"
+            ))
         );
     }
 
@@ -12826,16 +12845,16 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn normalize_cached_channel_turns_filters_passive_group_context() {
         let turns = vec![
-            ChatMessage::user("[WhatsApp group message from rifuki]\nhello"),
+            ChatMessage::user("[Observed WhatsApp group message from rifuki]\nhello"),
             ChatMessage::assistant(WHATSAPP_PASSIVE_GROUP_CONTEXT_HISTORY_MARKER),
-            ChatMessage::user("real user message"),
+            ChatMessage::user("[Current WhatsApp group message from rifuki]\nreal user message"),
         ];
         let result = normalize_cached_channel_turns(turns);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
         assert_eq!(
             result[0].content,
-            "[WhatsApp group message from rifuki]\nhello\n\nreal user message"
+            "[Observed WhatsApp group message from rifuki]\nhello\n\n[Current WhatsApp group message from rifuki]\nreal user message"
         );
     }
 
@@ -14120,7 +14139,7 @@ This is an example JSON object for profile settings."#;
 
         assert_eq!(
             channel_history_content_for_message(&msg),
-            "[WhatsApp group message from +11111111111]\nzeroclaw --version"
+            "[Current WhatsApp group message from +11111111111]\nzeroclaw --version"
         );
     }
 
@@ -14139,7 +14158,7 @@ This is an example JSON object for profile settings."#;
         };
         let full_content = channel_full_content_for_message(&msg);
 
-        assert!(full_content.starts_with("[WhatsApp group message from +11111111111]"));
+        assert!(full_content.starts_with("[Current WhatsApp group message from +11111111111]"));
         assert!(full_content.contains("[IMAGE:data:image/png;base64,abcd]"));
     }
 
