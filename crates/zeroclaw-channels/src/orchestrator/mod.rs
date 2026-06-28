@@ -1209,7 +1209,14 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(
         channel_name,
-        "telegram" | "discord" | "matrix" | "slack" | "wecom_ws"
+        "telegram"
+            | "discord"
+            | "matrix"
+            | "slack"
+            | "wecom_ws"
+            | "whatsapp"
+            | "whatsapp-web"
+            | "whatsapp_web"
     )
 }
 
@@ -17301,6 +17308,22 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_model_switch_for_whatsapp_web() {
+        for channel in ["whatsapp", "whatsapp-web", "whatsapp_web"] {
+            assert_eq!(
+                parse_runtime_command(channel, "/models openrouter"),
+                Some(ChannelRuntimeCommand::SetProvider("openrouter".into())),
+                "{channel} should accept /models"
+            );
+            assert_eq!(
+                parse_runtime_command(channel, "/model qwen-max"),
+                Some(ChannelRuntimeCommand::SetModel("qwen-max".into())),
+                "{channel} should accept /model"
+            );
+        }
     }
 
     fn scope_test_msg(
