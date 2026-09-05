@@ -850,6 +850,7 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
+    passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Outcome of the most recent `getUpdates` exchange and when it completed,
@@ -2466,6 +2467,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             per_user_session: true,
+            passive_group_context: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             poll_health: Mutex::new(None),
@@ -2510,6 +2512,20 @@ impl TelegramChannel {
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
         self
+    }
+
+    /// Record unaddressed group messages as passive context instead of dropping them.
+    pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
+        self.passive_group_context = enabled;
+        self
+    }
+
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -5053,14 +5069,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
+        let mut passive_context = false;
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            // If the user is replying directly to the bot's message, bypass
-            // the mention check — replies are an unambiguous signal of intent.
-            if !Self::contains_bot_mention(text, bot_username) {
+            // A direct reply to the bot's message is an unambiguous signal
+            // of intent, so it counts as addressed alongside an @-mention.
+            let addressed = Self::contains_bot_mention(text, bot_username) || {
                 let bot_id = *self.bot_id.lock();
-                if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+            };
+            if !addressed {
+                if Self::should_record_passive_group_context(
+                    self.passive_group_context,
+                    is_group,
+                    addressed,
+                ) {
+                    passive_context = true;
+                } else {
                     return None;
                 }
             }
@@ -5087,7 +5113,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let content = if self.mention_only && is_group && !passive_context {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
@@ -5133,6 +5159,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            passive_context,
             conversation_scope: self.conversation_scope_for(message),
 
             ..Default::default()
@@ -7781,6 +7808,74 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_record_passive_group_context_matches_predicate() {
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(TelegramChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    fn passive_group_message_keeps_the_native_conversation_scope() {
+        use zeroclaw_api::channel::ChannelConversationScope;
+
+        // Passive recording must not invent its own history key: the
+        // observation lands in the same session an addressed message would
+        // use, which `conversation_scope_for` derives from `per_user_session`.
+        let mention_only = true;
+        let group_msg = || {
+            serde_json::json!({
+                "message": {
+                    "message_id": 11,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "text": "just chatting with bob"
+                }
+            })
+        };
+
+        let shared = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true)
+        .with_per_user_session(false);
+        *shared.bot_username.lock() = Some("testbot".to_string());
+        let passive = shared
+            .parse_update_message(&group_msg())
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(passive.passive_context);
+        assert_eq!(
+            passive.conversation_scope,
+            ChannelConversationScope::ReplyTarget
+        );
+
+        let per_user = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true);
+        *per_user.bot_username.lock() = Some("testbot".to_string());
+        let passive = per_user
+            .parse_update_message(&group_msg())
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(passive.passive_context);
+        assert_eq!(passive.conversation_scope, ChannelConversationScope::Sender);
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
