@@ -1,0 +1,43 @@
+name: Rifuki Build ZeroClaw macOS
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/tg-passive
+env:
+  TARGET: aarch64-apple-darwin
+  FEATURES: whatsapp-web
+permissions:
+  contents: read
+concurrency:
+  group: rifuki-zeroclaw-macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: Build macOS ARM64 with WhatsApp Web
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rifuki-zeroclaw-${{ env.TARGET }}-${{ env.FEATURES }}
+      - name: Build release binary
+        run: cargo build --release --locked --features "${FEATURES}" --target "${TARGET}" --bin zeroclaw
+      - name: Package artifact
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifact
+          cp "target/${TARGET}/release/zeroclaw" artifact/zeroclaw
+          strip artifact/zeroclaw
+          tar -C artifact -czf "zeroclaw-${TARGET}-wa-web.tar.gz" zeroclaw
+          shasum -a 256 "zeroclaw-${TARGET}-wa-web.tar.gz" > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-macos-arm64-wa-web
+          path: |
+            zeroclaw-${{ env.TARGET }}-wa-web.tar.gz
+            SHA256SUMS
