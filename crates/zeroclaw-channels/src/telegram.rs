@@ -6332,25 +6332,29 @@ impl TelegramChannel {
         update: &serde_json::Value,
         msg: ChannelMessage,
     ) -> bool {
-        if self.ack_reactions
-            && let Some((reaction_chat_id, reaction_message_id)) =
-                Self::extract_update_message_target(update)
-        {
-            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
-        }
+        // Silent observation: a passive message must not tell the room the
+        // bot saw it, so it gets neither an ack reaction nor a typing hint.
+        if !msg.passive_context {
+            if self.ack_reactions
+                && let Some((reaction_chat_id, reaction_message_id)) =
+                    Self::extract_update_message_target(update)
+            {
+                self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+            }
 
-        // Send one typing indicator for the logical inbound message. A media
-        // group reaches this helper only after all members are materialized.
-        let typing_body = serde_json::json!({
-            "chat_id": &msg.reply_target,
-            "action": "typing"
-        });
-        let _ = self
-            .http_client()
-            .post(self.api_url("sendChatAction"))
-            .json(&typing_body)
-            .send()
-            .await;
+            // Send one typing indicator for the logical inbound message. A media
+            // group reaches this helper only after all members are materialized.
+            let typing_body = serde_json::json!({
+                "chat_id": &msg.reply_target,
+                "action": "typing"
+            });
+            let _ = self
+                .http_client()
+                .post(self.api_url("sendChatAction"))
+                .json(&typing_body)
+                .send()
+                .await;
+        }
 
         tx.send(msg).await.is_ok()
     }
@@ -11596,6 +11600,73 @@ mod tests {
             .expect_parsed("reply-thread photo should parse");
         assert_eq!(reply.reply_target, "-100200300");
         assert_eq!(reply.thread_ts, None);
+    }
+
+    #[tokio::test]
+    async fn opted_in_group_media_shares_the_text_conversation_scope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelConversationScope;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes = tiny_jpeg();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes.clone()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        // The shared room session is what puts media and text in one history.
+        .with_per_user_session(false)
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // The media mention gate reads the cached bot username synchronously,
+        // so prime it the way the live listener does before the first update.
+        ch.get_bot_username().await;
+
+        let photo = ch
+            .try_parse_attachment_message(&serde_json::json!({
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "photo": [ { "file_id": "best", "file_size": 20 } ],
+                    "caption": "@testbot look at this"
+                }
+            }))
+            .await
+            .expect_parsed("group photo should parse");
+
+        assert_eq!(
+            photo.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "admitted group media must share the opted-in group history, not fall back to sender scope"
+        );
     }
 
     #[tokio::test]
@@ -19521,6 +19592,80 @@ mod tests {
         assert_eq!(
             edit_body["reply_markup"],
             serde_json::json!({ "inline_keyboard": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_group_message_reaches_history_without_any_side_effect() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/bot[^/]+/(sendChatAction|setMessageReaction)$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_ack_reactions(true)
+        .with_api_base(mock_server.uri());
+        ch.get_bot_username().await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 11,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "just chatting with bob"
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+
+        let recorded = rx
+            .try_recv()
+            .expect("passive message must still be recorded");
+        assert!(recorded.passive_context, "message should be passive");
+
+        // The ack reaction is fired from a spawned task, so give it a chance to
+        // reach the mock before asserting that it never happened.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let side_effects: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/sendChatAction") || p.ends_with("/setMessageReaction"))
+            .collect();
+        assert!(
+            side_effects.is_empty(),
+            "passive observation must stay silent, but the bot called: {side_effects:?}"
         );
     }
 

@@ -9954,12 +9954,16 @@ async fn run_message_dispatch_loop(
         // intentionally unowned by an agent; it can present gate prompts but
         // must never receive ordinary agent traffic. All live contexts share
         // this global channel registry and prompt config.
+        // Guarded here, not in the worker: these paths answer and cancel before
+        // the worker runs. The worker still records the passive turn.
         let gate_ctx = router
             .single_ctx
             .as_ref()
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
-        if let Some(gate_ctx) = gate_ctx {
+        if !msg.passive_context
+            && let Some(gate_ctx) = gate_ctx
+        {
             let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
             let gate_channel_route_keys = gate_channel
                 .as_ref()
@@ -10001,7 +10005,7 @@ async fn run_message_dispatch_loop(
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
         // ordinary messages to an agent-owned runtime.
-        if dispatch_channel_sop_event(&router, &msg).await {
+        if !msg.passive_context && dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
         // Fast path: /stop cancels every live turn of this sender scope — the
@@ -10009,7 +10013,9 @@ async fn run_message_dispatch_loop(
         // spawning a worker or registering a new task. Handled here in the
         // dispatch loop so the target registrations are still in the store;
         // each cancelled turn removes its own entry when it releases.
-        if msg.channel != "cli" && is_stop_command(&msg.content) {
+        // A passive observation carries no turn of its own and must not cancel
+        // the sender's live turns or answer in the room.
+        if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
             let scope_key = interruption_scope_key(&msg);
             let states = {
                 let active = in_flight_by_sender
@@ -15265,6 +15271,22 @@ fn concurrent_persist_lock_serialization() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn shared_room_history_keeps_the_speaker_for_any_channel() {
+        let msg = ChannelMessage {
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..ChannelMessage::new("1", "alice", "-100200300", "I'll deploy", "telegram", 0)
+        };
+
+        let rendered = timestamped_channel_user_history_content(&msg, "Observed group message");
+
+        assert!(
+            rendered.contains("alice"),
+            "shared Telegram history must name the speaker, got: {rendered}"
+        );
+    }
+
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
     // pin the built-in filter's own behavior.
@@ -25407,6 +25429,160 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_stop_command_does_not_cancel_another_participants_turn() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "forwarded content".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/stop".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                passive_context: true,
+
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "the addressed turn must still answer: a passive /stop is not this bot's stop"
+        );
+        assert!(sent_messages[0].contains("response-1"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "a passive message must not start a turn of its own"
         );
     }
 
