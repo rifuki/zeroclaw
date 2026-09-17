@@ -15687,6 +15687,13 @@ pub struct TelegramConfig {
     /// Requires `mention_only = true`. With the default `mention_only = false`
     /// the bot already answers every authorized group message, so there is no
     /// unaddressed message left to record and this flag changes nothing.
+    ///
+    /// Also requires `per_user_session = false`. A passive observation is
+    /// recorded in the same session an addressed message from that sender
+    /// would use, so with the default `per_user_session = true` each member's
+    /// chatter lands in that member's own session and never reaches the
+    /// participant who later @-mentions the bot. Set both to share one
+    /// group/topic history that the bot can answer from.
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
