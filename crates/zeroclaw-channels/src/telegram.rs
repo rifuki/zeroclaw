@@ -5137,7 +5137,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Exit input-driven voice mode when user switches back to typing.
         // Config-mandated voice peers (output_modality = "voice") stay in
         // voice mode regardless of whether they send text or voice.
-        if !self.is_voice_peer(&reply_target)
+        //
+        // A passive observation is not the addressed participant switching
+        // back to typing, so it leaves the room's voice mode alone. Without
+        // this guard, unaddressed chatter from another member would silently
+        // downgrade the pending voice answer to text.
+        if !passive_context
+            && !self.is_voice_peer(&reply_target)
             && let Ok(mut vc) = self.voice_chats.lock()
         {
             vc.remove(&reply_target);
@@ -7879,6 +7885,60 @@ mod tests {
             .expect("opted-in passive group message must be recorded, not dropped");
         assert!(passive.passive_context);
         assert_eq!(passive.conversation_scope, ChannelConversationScope::Sender);
+    }
+
+    #[test]
+    fn passive_group_text_preserves_input_driven_voice_mode() {
+        // A voice message puts the room in input-driven voice mode, and the
+        // addressed participant's next text answer leaves it. Passive chatter
+        // from another member is not that participant switching back to
+        // typing, so the pending voice reply must survive it.
+        let channel = || {
+            let ch = TelegramChannel::new(
+                "token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                true,
+            )
+            .with_passive_group_context(true)
+            .with_per_user_session(false);
+            *ch.bot_username.lock() = Some("testbot".to_string());
+            ch.voice_chats
+                .lock()
+                .unwrap()
+                .insert("-100200300".to_string());
+            ch
+        };
+        let group_text = |text: &str| {
+            serde_json::json!({
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "bob", "id": 77 },
+                    "text": text
+                }
+            })
+        };
+
+        let passive = channel();
+        let observed = passive
+            .parse_update_message(&group_text("just chatting with the others"))
+            .expect("opted-in passive group message must be recorded, not dropped");
+        assert!(observed.passive_context);
+        assert!(
+            passive.is_voice_chat("-100200300"),
+            "passive observation must leave input-driven voice mode intact"
+        );
+
+        let addressed = channel();
+        let answered = addressed
+            .parse_update_message(&group_text("@testbot answer in text please"))
+            .expect("addressed group message must be delivered");
+        assert!(!answered.passive_context);
+        assert!(
+            !addressed.is_voice_chat("-100200300"),
+            "an addressed text message must still exit input-driven voice mode"
+        );
     }
 
     #[test]
