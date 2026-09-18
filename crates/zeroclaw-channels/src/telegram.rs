@@ -2548,11 +2548,15 @@ impl TelegramChannel {
     /// group/supergroup chats when `per_user_session = false`, sender-scoped
     /// otherwise. `reply_target` already carries `chat_id:message_thread_id`
     /// for forum topics, so room scope still isolates topics from each other.
+    ///
+    /// `passive_group_context` selects room scope too: an observation filed
+    /// in the observed member's own session could answer nobody.
     fn conversation_scope_for(
         &self,
         message: &serde_json::Value,
     ) -> zeroclaw_api::channel::ChannelConversationScope {
-        if !self.per_user_session && Self::is_group_message(message) {
+        if (!self.per_user_session || self.passive_group_context) && Self::is_group_message(message)
+        {
             zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
         } else {
             zeroclaw_api::channel::ChannelConversationScope::Sender
@@ -5138,10 +5142,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Config-mandated voice peers (output_modality = "voice") stay in
         // voice mode regardless of whether they send text or voice.
         //
-        // A passive observation is not the addressed participant switching
-        // back to typing, so it leaves the room's voice mode alone. Without
-        // this guard, unaddressed chatter from another member would silently
-        // downgrade the pending voice answer to text.
+        // A passive observation is not that participant, so it leaves the
+        // room's voice mode alone.
         if !passive_context
             && !self.is_voice_peer(&reply_target)
             && let Ok(mut vc) = self.voice_chats.lock()
@@ -7836,12 +7838,9 @@ mod tests {
     }
 
     #[test]
-    fn passive_group_message_keeps_the_native_conversation_scope() {
+    fn passive_group_context_shares_group_history_whatever_per_user_session_says() {
         use zeroclaw_api::channel::ChannelConversationScope;
 
-        // Passive recording must not invent its own history key: the
-        // observation lands in the same session an addressed message would
-        // use, which `conversation_scope_for` derives from `per_user_session`.
         let mention_only = true;
         let group_msg = || {
             serde_json::json!({
@@ -7878,21 +7877,39 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_passive_group_context(true);
+        .with_passive_group_context(true)
+        .with_per_user_session(true);
         *per_user.bot_username.lock() = Some("testbot".to_string());
         let passive = per_user
             .parse_update_message(&group_msg())
             .expect("opted-in passive group message must be recorded, not dropped");
         assert!(passive.passive_context);
-        assert_eq!(passive.conversation_scope, ChannelConversationScope::Sender);
+        assert_eq!(
+            passive.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "the opt-in must share group history even under the per_user_session default"
+        );
+
+        let dm = serde_json::json!({
+            "message": {
+                "message_id": 12,
+                "chat": { "id": 4242, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "hello"
+            }
+        });
+        let addressed = per_user
+            .parse_update_message(&dm)
+            .expect("direct message must be delivered");
+        assert!(!addressed.passive_context);
+        assert_eq!(
+            addressed.conversation_scope,
+            ChannelConversationScope::Sender
+        );
     }
 
     #[test]
     fn passive_group_text_preserves_input_driven_voice_mode() {
-        // A voice message puts the room in input-driven voice mode, and the
-        // addressed participant's next text answer leaves it. Passive chatter
-        // from another member is not that participant switching back to
-        // typing, so the pending voice reply must survive it.
         let channel = || {
             let ch = TelegramChannel::new(
                 "token".into(),

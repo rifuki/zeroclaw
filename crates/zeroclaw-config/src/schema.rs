@@ -15688,12 +15688,11 @@ pub struct TelegramConfig {
     /// the bot already answers every authorized group message, so there is no
     /// unaddressed message left to record and this flag changes nothing.
     ///
-    /// Also requires `per_user_session = false`. A passive observation is
-    /// recorded in the same session an addressed message from that sender
-    /// would use, so with the default `per_user_session = true` each member's
-    /// chatter lands in that member's own session and never reaches the
-    /// participant who later @-mentions the bot. Set both to share one
-    /// group/topic history that the bot can answer from.
+    /// Enabling this also puts the group/topic on one shared history, the
+    /// way `per_user_session = false` does, because an observation filed in
+    /// the observed member's own session could never answer the participant
+    /// who later @-mentions the bot. Scheduling stays personal either way:
+    /// message debouncing, `/stop` and interruption still key on the sender.
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
