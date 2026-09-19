@@ -15684,15 +15684,20 @@ pub struct TelegramConfig {
     /// without starting an agent turn. Lets the bot follow the discussion and
     /// answer with full context when later @-mentioned. Default: `false`.
     ///
-    /// Requires `mention_only = true`. With the default `mention_only = false`
-    /// the bot already answers every authorized group message, so there is no
-    /// unaddressed message left to record and this flag changes nothing.
+    /// Recording passive messages requires `mention_only = true`: with the
+    /// default `mention_only = false` the bot already answers every
+    /// authorized group message, so no unaddressed message is left to record.
     ///
-    /// Enabling this also puts the group/topic on one shared history, the
-    /// way `per_user_session = false` does, because an observation filed in
-    /// the observed member's own session could never answer the participant
-    /// who later @-mentions the bot. Scheduling stays personal either way:
-    /// message debouncing, `/stop` and interruption still key on the sender.
+    /// Shared history is not gated that way. Enabling this flag puts every
+    /// group/topic message on one shared session, the way
+    /// `per_user_session = false` does, whatever `mention_only` says and
+    /// whatever `per_user_session` says, because an observation filed in the
+    /// observed member's own session could never answer the participant who
+    /// later @-mentions the bot. Members therefore share conversation
+    /// context and the session-scoped controls that come with it, so any
+    /// member's `/new` resets the history for the whole group/topic.
+    /// Scheduling stays personal: message debouncing, `/stop` and
+    /// interruption still key on the sender.
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,

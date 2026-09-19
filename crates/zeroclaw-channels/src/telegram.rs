@@ -7906,6 +7906,28 @@ mod tests {
             addressed.conversation_scope,
             ChannelConversationScope::Sender
         );
+
+        // Without mention gating nothing is left unaddressed to record, but
+        // the group still moves to shared history, which is what the schema
+        // help has to state.
+        let answer_all = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_passive_group_context(true)
+        .with_per_user_session(true);
+        *answer_all.bot_username.lock() = Some("testbot".to_string());
+        let active = answer_all
+            .parse_update_message(&group_msg())
+            .expect("without mention gating every authorized group message is delivered");
+        assert!(!active.passive_context);
+        assert_eq!(
+            active.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "the opt-in shares group history even with mention gating off"
+        );
     }
 
     #[test]
